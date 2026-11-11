@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.IO;
@@ -198,6 +199,17 @@ namespace UniversalUtilities
         public IReadOnlyList<ColumnStruct> ColumnDefinitions
         {
             get { return columnDefinitionsView; }
+        }
+
+        /// <summary>
+        /// 固定列集合。列在构造时创建，设计器不应把构造函数中的列再次序列化到 InitializeComponent，
+        /// 否则运行时会重复添加列。
+        /// </summary>
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public new DataGridViewColumnCollection Columns
+        {
+            get { return base.Columns; }
         }
 
         /// <summary>

@@ -36,6 +36,44 @@ packages/            # NuGet 还原目录，不提交
 run-tests.ps1
 ```
 
+## VS WinForms 设计器
+
+`IndustrialDataGridView<T>` 是**泛型抽象基类**，WinForms 设计器不能直接实例化泛型/抽象控件，所以不能直接从工具箱拖它。正确做法是增加一个具体、非泛型子类：
+
+```csharp
+public sealed class ChannelGrid : IndustrialDataGridView<Channel>
+{
+    // 设计器需要公开无参构造
+    public ChannelGrid()
+        : base(CreateDefaultColumns(), Color.Black, Color.DarkBlue)
+    {
+    }
+
+    private static IReadOnlyList<ColumnStruct> CreateDefaultColumns()
+    {
+        return new[]
+        {
+            new ColumnStruct { columnName = "Name", columnType = typeof(string), headerText = "通道", width = 120 },
+            new ColumnStruct { columnName = "Value", columnType = typeof(double), headerText = "值", width = 100, format = "F3" }
+        };
+    }
+
+    protected override object[] GetRowValues(Channel c)
+    {
+        return new object[] { c.Name, c.Value };
+    }
+}
+```
+
+步骤：
+
+1. 把上述具体类放在窗体所在项目（或窗体引用的类库）中；
+2. 确保类是 `public`、**有公开无参构造函数**，且构造函数里不要访问数据库/设备；
+3. 重新生成项目；
+4. 在工具箱中“选择项”加入该具体类，或直接把它拖到窗体上。
+
+Demo 中的 `DemoGrid` 已改成 `public` 并提供无参构造，可作为模板。注意：设计器创建的是无参构造中的默认列；如果不同窗体需要不同列，建议在代码中创建控件，或为该场景再做一个具体适配类。
+
 ## 编译
 
 用 Visual Studio 打开 `IndustrialDataGridView.sln`，或：

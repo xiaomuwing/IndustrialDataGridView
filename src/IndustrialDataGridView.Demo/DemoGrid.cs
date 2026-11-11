@@ -5,7 +5,7 @@ using UniversalUtilities;
 
 namespace IndustrialDataGridView.Demo
 {
-    internal sealed class DemoRow
+    public sealed class DemoRow
     {
         public int Id;
         public string Name;
@@ -81,8 +81,17 @@ namespace IndustrialDataGridView.Demo
         }
     }
 
-    internal sealed class DemoGrid : IndustrialDataGridView<DemoRow>
+    /// <summary>
+    /// 具体、非泛型的子类示例。公开且带无参构造，WinForms 设计器才能实例化并放到窗体上；
+    /// 泛型抽象基类本身不能直接拖入设计器。
+    /// </summary>
+    public sealed class DemoGrid : IndustrialDataGridView<DemoRow>
     {
+        public DemoGrid()
+            : this(DemoRows.CreateColumns(), Color.FromArgb(22, 22, 24), Color.FromArgb(0, 88, 140))
+        {
+        }
+
         public DemoGrid(IReadOnlyList<ColumnStruct> columns, Color back, Color select)
             : base(columns, back, select)
         {
