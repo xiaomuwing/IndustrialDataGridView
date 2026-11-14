@@ -3,7 +3,7 @@
 `IndustrialDataGridView<T>` 的独立 .NET Framework 4.8 解决方案，包含：
 
 - **IndustrialDataGridView**：类库，生成 `IndustrialDataGridView.dll`；
-- **IndustrialDataGridView.Tests**：MSTest 测试（72 个用例，包含 48 个可靠性与审核修复回归用例）；
+- **IndustrialDataGridView.Tests**：MSTest 测试（73 个用例，包含 49 个可靠性与审核修复回归用例）；
 - **IndustrialDataGridView.Demo**：WinForms 演示程序。
 
 ## 环境
@@ -110,7 +110,7 @@ pwsh -NoProfile -File .\run-tests.ps1
 pwsh -NoProfile -File .\run-tests.ps1 -Filter "FullyQualifiedName~IndustrialDataGridViewTests"
 ```
 
-当前 72 个用例全部通过。回归覆盖后台更新与增删/重建、外键与只读列异常、UI 消息响应、空值、锁定列换序、备份恢复与保存重试、迁移回滚、选中通知、字体/Padding、稳定行句柄，以及隔离布局路径的 Demo 窗口排序刷新和逐列显隐。审核历史文档已清理；当前验证结果以本文和测试结果为准。
+当前 73 个用例全部通过。回归覆盖后台更新与增删/重建、外键与只读列异常、UI 消息响应、空值、锁定列换序、备份恢复与保存重试、迁移回滚、选中通知、字体/Padding、稳定行句柄，以及隔离布局路径的 Demo 窗口排序刷新和逐列显隐。审核历史文档已清理；当前验证结果以本文和测试结果为准。
 
 脚本先通过 `vswhere` 查找已安装的最新工具，再回退到 PATH；也可指定 `-MSBuildPath` 和 `-VSTestPath`。遇到编译器服务器版本冲突时，加 `-DisableSharedCompilation`。本次验证使用该参数。
 
@@ -125,6 +125,7 @@ pwsh -NoProfile -File .\run-tests.ps1 -Filter "FullyQualifiedName~IndustrialData
 - 500 行初始数据，4 Hz 更新可见行；报警状态始终同步全表，保证报警排序使用当前状态；
 - 运行时添加行、删除选中行；
 - 点击 `Id` / `Name` / `Status` / `Group` 列头排序；
+- 列对齐示例：`Id`、`Status`、`Unit`、`Group`、`Updated` 居中，`Name`、`Note` 左对齐，数值列右对齐；
 - 拖动列头换序，布局自动保存到 `%LOCALAPPDATA%\IndustrialDataGridView.Demo\DemoGrid.layout.json`，下次启动恢复；首次运行兼容读取程序目录里的旧布局；
 - 前两列锁定（冻结、始终可见、不可隐藏/换序）；
 - 报警列为真时整行使用红色背景、白色前景（`AlarmColumnKey` / `AlarmRowBackColor` / `AlarmRowForeColor`）；选中报警行默认沿用普通选中色，选中状态不会被红色吞掉；

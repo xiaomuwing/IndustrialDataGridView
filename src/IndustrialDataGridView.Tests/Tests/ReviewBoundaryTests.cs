@@ -140,5 +140,19 @@ namespace UniversalUtilities.Tests
                 } finally { TestHelpers.DeleteDirectory(dir); }
             });
         }
+
+        [TestMethod]
+        public void Demo列_显式对齐配置应作用到实际列()
+        {
+            TestHelpers.RunSta(() => {
+                using (var grid = new IndustrialDataGridView.Demo.DemoGrid()) {
+                    Assert.AreEqual(DataGridViewContentAlignment.MiddleCenter, grid.Columns["Id"].DefaultCellStyle.Alignment);
+                    Assert.AreEqual(DataGridViewContentAlignment.MiddleCenter, grid.Columns["Status"].DefaultCellStyle.Alignment);
+                    Assert.AreEqual(DataGridViewContentAlignment.MiddleRight, grid.Columns["Value"].DefaultCellStyle.Alignment);
+                    Assert.AreEqual(DataGridViewContentAlignment.MiddleCenter, grid.Columns["Updated"].DefaultCellStyle.Alignment);
+                    Assert.AreEqual(DataGridViewContentAlignment.MiddleLeft, grid.Columns["Note"].DefaultCellStyle.Alignment);
+                }
+            });
+        }
     }
 }
