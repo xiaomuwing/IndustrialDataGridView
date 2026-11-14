@@ -1,12 +1,21 @@
 # IndustrialDataGridView
 
-`IndustrialDataGridView<T>` 的独立 .NET Framework 4.8 解决方案，包含：
+`IndustrialDataGridView<T>` 同时提供 **.NET Framework 4.8** 和 **.NET 10** 两个版本，包含：
 
 - **IndustrialDataGridView**：类库，生成 `IndustrialDataGridView.dll`；
 - **IndustrialDataGridView.Tests**：MSTest 测试（73 个用例，包含 49 个可靠性与审核修复回归用例）；
-- **IndustrialDataGridView.Demo**：WinForms 演示程序。
+- **IndustrialDataGridView.Demo**：Windows 窗体演示程序。
 
-> **`.NET 10` 移植工程位于 [`net10/`](net10/README.md)**，包含独立的解决方案、演示程序、73 项测试和性能对比；根目录工程仍面向 `.NET Framework 4.8`。
+**主分支同时包含两个版本。**
+
+## 版本选择
+
+| 版本 | 目标框架 | 解决方案 | 说明 |
+|---|---|---|---|
+| .NET Framework 4.8 | `v4.8` | `IndustrialDataGridView.sln` | 根目录版本，面向现有 .NET Framework 调用方 |
+| .NET 10 | `net10.0-windows` | [`net10/IndustrialDataGridView.NET10.sln`](net10/IndustrialDataGridView.NET10.sln) | 独立移植工程，见 [`net10/README.md`](net10/README.md) |
+
+两个版本当前各有 **73 项测试**。.NET 10 版本与 .NET Framework 版本的刷新速度、处理器和内存占用对比见 [net10/PERFORMANCE.md](net10/PERFORMANCE.md)。
 
 ## 环境
 
@@ -35,6 +44,11 @@ src/
     Program.cs
     IndustrialDataGridView.Demo.csproj
 packages/            # NuGet 还原目录，不提交
+net10/
+  IndustrialDataGridView.NET10.sln
+  src/
+  README.md
+  PERFORMANCE.md
 run-tests.ps1
 ```
 

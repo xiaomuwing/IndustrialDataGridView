@@ -1,6 +1,6 @@
 # IndustrialDataGridView .NET 10 版
 
-这是 `IndustrialDataGridView<T>` 的 .NET 10 移植工程，目标框架为 `net10.0-windows`。
+这是主分支 `net10/` 目录中的 `IndustrialDataGridView<T>` .NET 10 移植工程，目标框架为 `net10.0-windows`。`.NET Framework 4.8` 版本位于仓库根目录。
 
 ## 项目结构
 
