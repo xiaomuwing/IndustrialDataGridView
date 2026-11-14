@@ -6,6 +6,8 @@
 - **IndustrialDataGridView.Tests**：MSTest 测试（73 个用例，包含 49 个可靠性与审核修复回归用例）；
 - **IndustrialDataGridView.Demo**：WinForms 演示程序。
 
+> **`.NET 10` 移植工程位于 [`net10/`](net10/README.md)**，包含独立的解决方案、演示程序、73 项测试和性能对比；根目录工程仍面向 `.NET Framework 4.8`。
+
 ## 环境
 
 - Windows
