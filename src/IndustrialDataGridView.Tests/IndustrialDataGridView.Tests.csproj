@@ -12,7 +12,7 @@
     <RootNamespace>UniversalUtilities.Tests</RootNamespace>
     <AssemblyName>IndustrialDataGridView.Tests</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
-    <LangVersion>12.0</LangVersion>
+    <LangVersion>7.3</LangVersion>
     <FileAlignment>512</FileAlignment>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <Deterministic>true</Deterministic>
@@ -42,11 +42,23 @@
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Data" />
+    <Reference Include="System.Xml" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Tests\IndustrialDataGridViewTests.cs" />
+    <Compile Include="Tests\RegressionTests.cs" />
+    <Compile Include="Tests\AuditFixTests.cs" />
+    <Compile Include="Tests\FollowupTests.cs" />
+    <Compile Include="Tests\ReviewBoundaryTests.cs" />
+    <Compile Include="..\IndustrialDataGridView.Demo\DemoGrid.cs">
+      <Link>Demo\DemoGrid.cs</Link>
+    </Compile>
+    <Compile Include="..\IndustrialDataGridView.Demo\MainForm.cs">
+      <Link>Demo\MainForm.cs</Link>
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="Tests\TestHelpers.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

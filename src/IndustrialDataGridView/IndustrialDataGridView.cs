@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Text;
@@ -18,7 +19,7 @@ namespace UniversalUtilities
     /// <remarks>
     /// <para>
     /// 设计约束：
-    /// 数据列在构造时固定、不允许排序、不允许用户编辑；每控件一个布局文件；
+        /// 数据列在构造时固定、按列定义允许排序、不允许用户编辑；每控件一个布局文件；
     /// 初始行集合用 <see cref="ShowRows"/> 建立，运行期可用 <see cref="AppendRow"/> / <see cref="InsertRow"/>
     /// / <see cref="RemoveRow(int)"/> 增删行；全量重建（<see cref="ShowRows"/> / <see cref="ClearRows"/>）
     /// 只能在控件不可见时执行。
@@ -88,6 +89,8 @@ namespace UniversalUtilities
         private const int LogicalDpi = 96;
         private const int ColumnWidthSaveDelayMs = 500;
         private const int MaxPendingUpdates = 100000;
+        private const int MaxDrainBatchSize = 512;
+        private const int DrainTimeBudgetMs = 8;
         private const long CellErrorLogIntervalTicks = 5 * TimeSpan.TicksPerSecond;
 
         private readonly DataTable dataTable;
@@ -97,7 +100,10 @@ namespace UniversalUtilities
         private readonly int ownerThreadId = Thread.CurrentThread.ManagedThreadId;
         private readonly List<Font> ownedFonts = new List<Font>();
         private readonly System.Windows.Forms.Timer columnWidthSaveTimer = new System.Windows.Forms.Timer();
-        private readonly ConcurrentQueue<CellUpdate> pendingUpdates = new ConcurrentQueue<CellUpdate>();
+        private readonly ConcurrentQueue<PendingCellUpdate> pendingUpdates = new ConcurrentQueue<PendingCellUpdate>();
+        private readonly System.Windows.Forms.Timer drainTimer = new System.Windows.Forms.Timer();
+        private readonly List<RowUpdateTarget> rowUpdateTargets = new List<RowUpdateTarget>();
+        private RowUpdateTarget[] publishedRowTargets = new RowUpdateTarget[0];
         private readonly List<T> rowItems = new List<T>();
         private readonly Dictionary<DataRow, T> rowMap = new Dictionary<DataRow, T>();
         private readonly List<DataGridViewColumn> lockedColumns = new List<DataGridViewColumn>();
@@ -105,12 +111,21 @@ namespace UniversalUtilities
 
         private Font appliedFont;
         private bool columnWidthSavePending;
+        private int layoutSaveRetryCount;
         private bool loadingLayout;
         private bool savingLayout;
         private bool layoutWidthsChangedByUser;
         private int widthsDpi = LogicalDpi;
-        private bool disposed;
+        private volatile bool disposed;
         private bool mutatingRows;
+        private bool selectionChangePending;
+        private bool updatingRowHeights;
+        private bool updatingStyleMetrics;
+        private bool styleMetricsPending;
+        private bool rowMappingNeedsValidation;
+        private DataTable conversionTable;
+        private DataRow conversionRow;
+        private bool lockedColumnRestorePending;
         private bool enforcingLockedColumns;
         private bool autoFittingWidths;
         private string alarmColumnKey;
@@ -126,6 +141,7 @@ namespace UniversalUtilities
         private long failedCellUpdateCount;
         private long lastCellErrorLogTicks;
         private string lastCellUpdateError;
+        private Exception lastCellUpdateException;
         private string lastLayoutError;
         private LayoutFileModel loadedLayout;
         private int loadedLayoutDpi;
@@ -187,12 +203,28 @@ namespace UniversalUtilities
 
             columnWidthSaveTimer.Interval = ColumnWidthSaveDelayMs;
             columnWidthSaveTimer.Tick += ColumnWidthSaveTimerTick;
+            drainTimer.Interval = 1;
+            drainTimer.Tick += delegate { drainTimer.Stop(); DrainPending(); };
             ColumnWidthChanged += OnColumnWidthChangedInternal;
             CellFormatting += OnCellFormattingInternal;
             ColumnDisplayIndexChanged += OnColumnDisplayIndexChangedInternal;
             ColumnStateChanged += OnColumnStateChangedInternal;
             Scroll += OnScrollUpdateRowHeights;
             Resize += OnResizeUpdateRowHeights;
+            CellStyleContentChanged += delegate { ScheduleStyleMetrics(); };
+            DefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            ColumnHeadersDefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            RowsDefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            AlternatingRowsDefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            ColumnDefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            CellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            RowDefaultCellStyleChanged += delegate { ScheduleStyleMetrics(); };
+            RowsAdded += OnRowsAddedInitializeHeight;
+            dataTable.RowChanged += delegate(object sender, DataRowChangeEventArgs e) {
+                if (!mutatingRows && (e.Action == DataRowAction.Add || e.Action == DataRowAction.Rollback)) rowMappingNeedsValidation = true;
+            };
+            dataTable.RowDeleted += delegate { if (!mutatingRows) rowMappingNeedsValidation = true; };
+            dataTable.TableCleared += delegate { if (!mutatingRows) rowMappingNeedsValidation = true; };
         }
 
         /// <summary>构造时传入的列定义（只读视图，顺序与 <see cref="DataGridView.Columns"/> / <see cref="Table"/> 的列顺序一致）。</summary>
@@ -223,6 +255,7 @@ namespace UniversalUtilities
             set
             {
                 EnsureUiThread();
+                RestoreLockedColumnOrder();
                 if (value < 0 || value > Columns.Count)
                 {
                     throw new ArgumentOutOfRangeException(nameof(value), "锁定列数必须在 0.." + Columns.Count + " 之间。");
@@ -273,8 +306,19 @@ namespace UniversalUtilities
                 {
                     return;
                 }
+                int index = GetColumnIndex(value);
+                if (!string.IsNullOrEmpty(value) && index < 0)
+                {
+                    throw new ArgumentException("报警列不存在: " + value, nameof(value));
+                }
+                if (index >= 0 && columnDefinitions[index].columnType != typeof(bool)
+                    && columnDefinitions[index].columnType != typeof(string)
+                    && !IsNumericType(columnDefinitions[index].columnType))
+                {
+                    throw new ArgumentException("报警列必须为布尔、数值或布尔文本类型。", nameof(value));
+                }
                 alarmColumnKey = value;
-                alarmColumnIndex = GetColumnIndex(value);
+                alarmColumnIndex = index;
                 Invalidate();
             }
         }
@@ -393,6 +437,7 @@ namespace UniversalUtilities
         /// 控件内部的 <see cref="DataTable"/>。派生类可直接读取；修改请使用
         /// <see cref="SetCell(int,int,object)"/> / <see cref="ApplyUpdates"/> / <see cref="PostUpdates"/>，
         /// 不要直接改行集合（会绕过上限与线程检查）。
+        /// 外键验证要求父子表位于同一 DataSet，并启用 EnforceConstraints；独立表外键不受支持。
         /// </summary>
         public DataTable Table
         {
@@ -404,6 +449,9 @@ namespace UniversalUtilities
         /// 构造之后设置本属性不会自动读取，需要调用 <see cref="LoadLayout"/>。
         /// </summary>
         public string LayoutFile { get; set; }
+
+        /// <summary>布局操作的非致命提示，例如从备份恢复或旧文件清理失败；成功保存后清空。</summary>
+        public string LastLayoutWarning { get; private set; }
 
         /// <summary>最近一次布局读写/迁移的错误信息；成功时为 <see langword="null"/>。</summary>
         public string LastLayoutError
@@ -425,7 +473,7 @@ namespace UniversalUtilities
             get { return Interlocked.Read(ref failedCellUpdateCount); }
         }
 
-        /// <summary>因队列已满而丢弃的增量更新条数。</summary>
+        /// <summary>因队列已满或目标行已删除/替换/重建而丢弃的增量更新条数。</summary>
         public long DroppedUpdateCount
         {
             get { return Interlocked.Read(ref droppedUpdateCount); }
@@ -452,10 +500,13 @@ namespace UniversalUtilities
         /// </exception>
         /// <remarks>
         /// 全量重建会重置选中行与滚动位置，这是本控件的既定语义；常规 0.1 秒刷新请勿调用本方法。
+        /// 外键验证要求父子表位于同一 DataSet 且 EnforceConstraints=true；独立表跨表外键不受支持。
+        /// 预验证复制 DataSet 的结构，但只复制通过外键/关系连通的关联表数据，不复制无关归档或日志行。
         /// </remarks>
         public void ShowRows(IReadOnlyList<T> rows)
         {
             EnsureUiThread();
+            EnsureSupportedForeignKeys();
             if (rows == null)
             {
                 throw new ArgumentNullException(nameof(rows));
@@ -469,10 +520,24 @@ namespace UniversalUtilities
                 throw new InvalidOperationException("全量重建不能在控件可见时执行；请先隐藏控件或窗体，或改用 SetCell/ApplyUpdates 做增量刷新。");
             }
 
+            // 关联表的数据也是外键验证的一部分；仅 Clone 当前表不能验证跨表约束。
+            var items = new List<T>(rows.Count);
             var valuesList = new List<object[]>(rows.Count);
-            for (int i = 0; i < rows.Count; i++)
+            using (DataSet stagedSet = CreateValidationDataSet())
+            using (DataTable staged = stagedSet == null ? dataTable.Clone()
+                : stagedSet.Tables[dataTable.TableName, dataTable.Namespace])
             {
-                valuesList.Add(GetRowValuesChecked(rows[i], i));
+                bool enforce = dataTable.DataSet != null && dataTable.DataSet.EnforceConstraints;
+                if (stagedSet != null) stagedSet.EnforceConstraints = false;
+                staged.Rows.Clear();
+                for (int i = 0; i < rows.Count; i++)
+                {
+                    T item = rows[i];
+                    staged.Rows.Add(GetRowValuesChecked(item, i));
+                    items.Add(item);
+                }
+                if (stagedSet != null) stagedSet.EnforceConstraints = enforce;
+                foreach (DataRow row in staged.Rows) valuesList.Add(row.ItemArray);
             }
 
             SuspendLayout();
@@ -486,14 +551,17 @@ namespace UniversalUtilities
                     try
                     {
                         dataTable.Rows.Clear();
+                        InvalidateRowUpdateTargets();
                         rowMap.Clear();
                         rowItems.Clear();
                         for (int i = 0; i < valuesList.Count; i++)
                         {
                             DataRow dataRow = dataTable.Rows.Add(valuesList[i]);
-                            rowMap[dataRow] = rows[i];
-                            rowItems.Add(rows[i]);
+                            rowMap[dataRow] = items[i];
+                            rowItems.Add(items[i]);
+                            rowUpdateTargets.Add(new RowUpdateTarget(dataRow));
                         }
+                        rowMappingNeedsValidation = false;
                     }
                     finally
                     {
@@ -507,10 +575,142 @@ namespace UniversalUtilities
             }
             finally
             {
-                mutatingRows = false;
                 ResumeLayout(true);
+                CompleteRowMutation();
             }
             ForceFirstColumnVisible();
+        }
+
+        private void EnsureSupportedForeignKeys()
+        {
+            foreach (Constraint constraint in dataTable.Constraints)
+            {
+                var foreignKey = constraint as ForeignKeyConstraint;
+                if (foreignKey != null && (dataTable.DataSet == null || foreignKey.RelatedTable.DataSet != dataTable.DataSet))
+                    throw new InvalidOperationException("外键验证要求父子表位于同一 DataSet；独立 DataTable 上的外键不受支持。");
+            }
+        }
+
+        private DataSet CreateValidationDataSet()
+        {
+            DataSet source = dataTable.DataSet;
+            if (source == null) return null;
+            // 保留关系/表达式/命名空间等完整结构；无关大表仅有空结构，不导入数据。
+            var neighbors = new Dictionary<DataTable, HashSet<DataTable>>();
+            var externalReferences = new HashSet<DataTable>();
+            foreach (DataTable table in source.Tables) neighbors.Add(table, new HashSet<DataTable>());
+            foreach (DataTable table in source.Tables)
+                foreach (Constraint constraint in table.Constraints)
+                    if (constraint is ForeignKeyConstraint foreignKey)
+                    {
+                        if (!neighbors.ContainsKey(foreignKey.RelatedTable))
+                        {
+                            externalReferences.Add(table);
+                            continue;
+                        }
+                        neighbors[table].Add(foreignKey.RelatedTable);
+                        neighbors[foreignKey.RelatedTable].Add(table);
+                    }
+            // createConstraints=false 的关系也可能供 Parent/Child 表达式使用。
+            foreach (DataRelation relation in source.Relations)
+            {
+                neighbors[relation.ParentTable].Add(relation.ChildTable);
+                neighbors[relation.ChildTable].Add(relation.ParentTable);
+            }
+            var related = new HashSet<DataTable> { dataTable };
+            var pending = new Queue<DataTable>(); pending.Enqueue(dataTable);
+            while (pending.Count > 0)
+            {
+                DataTable current = pending.Dequeue();
+                if (externalReferences.Contains(current))
+                    throw new InvalidOperationException("当前表的关联数据含外部外键；相关父子表必须位于同一 DataSet。");
+                foreach (DataTable next in neighbors[current])
+                    if (related.Add(next)) pending.Enqueue(next);
+            }
+
+            // DataSet.Clone 本身也无法克隆指向集合外部的外键。此时只重建有效连通分量的结构。
+            DataSet staged = externalReferences.Count == 0 ? source.Clone() : CloneConnectedSchema(source, related);
+            try
+            {
+                staged.EnforceConstraints = false;
+                foreach (DataTable table in source.Tables)
+                {
+                    if (table == dataTable || !related.Contains(table)) continue;
+                    DataTable target = staged.Tables[table.TableName, table.Namespace];
+                    foreach (DataRow row in table.Rows) target.ImportRow(row);
+                }
+                return staged;
+            }
+            catch { staged.Dispose(); throw; }
+        }
+
+        private static DataSet CloneConnectedSchema(DataSet source, HashSet<DataTable> related)
+        {
+            var result = new DataSet(source.DataSetName) { Namespace = source.Namespace, Prefix = source.Prefix,
+                Locale = source.Locale, CaseSensitive = source.CaseSensitive, EnforceConstraints = false };
+            var copies = new Dictionary<DataTable, DataTable>();
+            try
+            {
+                foreach (DataTable table in source.Tables)
+                {
+                    if (!related.Contains(table)) continue;
+                    bool hasExpressions = false;
+                    foreach (DataColumn column in table.Columns) hasExpressions |= column.Expression.Length != 0;
+                    DataTable copy;
+                    if (!hasExpressions)
+                    {
+                        // 保留表内约束、自增状态等标准 Clone 行为；跨表外键稍后补齐。
+                        copy = table.Clone();
+                        copy.Namespace = table.Namespace;
+                    }
+                    else
+                    {
+                        // 单表 Clone 会过早绑定 Parent/Child 表达式；等关系齐全后再恢复表达式。
+                        copy = new DataTable(table.TableName) { Namespace = table.Namespace, Prefix = table.Prefix,
+                            Locale = table.Locale, CaseSensitive = table.CaseSensitive, MinimumCapacity = table.MinimumCapacity };
+                        foreach (DataColumn column in table.Columns)
+                        {
+                            var target = new DataColumn(column.ColumnName, column.DataType) { Caption = column.Caption,
+                                AllowDBNull = column.AllowDBNull, ReadOnly = column.ReadOnly, MaxLength = column.MaxLength,
+                                Namespace = column.Namespace, Prefix = column.Prefix, ColumnMapping = column.ColumnMapping,
+                                AutoIncrementSeed = column.AutoIncrementSeed, AutoIncrementStep = column.AutoIncrementStep,
+                                AutoIncrement = column.AutoIncrement, DefaultValue = column.DefaultValue };
+                            if (column.DataType == typeof(DateTime)) target.DateTimeMode = column.DateTimeMode;
+                            copy.Columns.Add(target);
+                        }
+                        foreach (Constraint constraint in table.Constraints)
+                            if (constraint is UniqueConstraint unique)
+                            {
+                                var columns = new DataColumn[unique.Columns.Length];
+                                for (int i = 0; i < columns.Length; i++) columns[i] = copy.Columns[unique.Columns[i].Ordinal];
+                                copy.Constraints.Add(new UniqueConstraint(unique.ConstraintName, columns, unique.IsPrimaryKey));
+                            }
+                    }
+                    result.Tables.Add(copy); copies.Add(table, copy);
+                }
+                foreach (DataTable table in related)
+                    foreach (Constraint constraint in table.Constraints)
+                        if (constraint is ForeignKeyConstraint key && !copies[table].Constraints.Contains(key.ConstraintName))
+                            copies[table].Constraints.Add(new ForeignKeyConstraint(key.ConstraintName,
+                                MapColumns(key.RelatedColumns, copies), MapColumns(key.Columns, copies)) {
+                                DeleteRule = key.DeleteRule, UpdateRule = key.UpdateRule, AcceptRejectRule = key.AcceptRejectRule });
+                foreach (DataRelation relation in source.Relations)
+                    if (related.Contains(relation.ParentTable) && related.Contains(relation.ChildTable))
+                        result.Relations.Add(new DataRelation(relation.RelationName, MapColumns(relation.ParentColumns, copies),
+                            MapColumns(relation.ChildColumns, copies), false) { Nested = relation.Nested });
+                foreach (DataTable table in related)
+                    foreach (DataColumn column in table.Columns)
+                        if (column.Expression.Length != 0) copies[table].Columns[column.Ordinal].Expression = column.Expression;
+                return result;
+            }
+            catch { result.Dispose(); throw; }
+        }
+
+        private static DataColumn[] MapColumns(DataColumn[] columns, Dictionary<DataTable, DataTable> copies)
+        {
+            var result = new DataColumn[columns.Length];
+            for (int i = 0; i < columns.Length; i++) result[i] = copies[columns[i].Table].Columns[columns[i].Ordinal];
+            return result;
         }
 
         /// <summary>
@@ -522,6 +722,7 @@ namespace UniversalUtilities
         public void AppendRow(T item)
         {
             EnsureUiThread();
+            EnsureRowMapping(-1);
             if (dataTable.Rows.Count >= MaxRowCount)
             {
                 throw new InvalidOperationException("已达到最大行数 " + MaxRowCount + "。");
@@ -534,10 +735,11 @@ namespace UniversalUtilities
                 DataRow dataRow = dataTable.Rows.Add(values);
                 rowItems.Add(item);
                 rowMap[dataRow] = item;
+                rowUpdateTargets.Add(new RowUpdateTarget(dataRow));
             }
             finally
             {
-                mutatingRows = false;
+                CompleteRowMutation();
             }
         }
 
@@ -551,6 +753,7 @@ namespace UniversalUtilities
         public void InsertRow(int rowIndex, T item)
         {
             EnsureUiThread();
+            EnsureRowMapping(-1);
             if (rowIndex < 0 || rowIndex > dataTable.Rows.Count)
             {
                 throw new ArgumentOutOfRangeException(nameof(rowIndex), "行索引必须在 0.." + dataTable.Rows.Count + " 之间。");
@@ -569,10 +772,11 @@ namespace UniversalUtilities
                 dataTable.Rows.InsertAt(dataRow, rowIndex);
                 rowItems.Insert(rowIndex, item);
                 rowMap[dataRow] = item;
+                rowUpdateTargets.Insert(rowIndex, new RowUpdateTarget(dataRow));
             }
             finally
             {
-                mutatingRows = false;
+                CompleteRowMutation();
             }
         }
 
@@ -597,10 +801,12 @@ namespace UniversalUtilities
                 dataTable.Rows.RemoveAt(rowIndex);
                 rowItems.RemoveAt(rowIndex);
                 rowMap.Remove(dataRow);
+                rowUpdateTargets[rowIndex].Active = false;
+                rowUpdateTargets.RemoveAt(rowIndex);
             }
             finally
             {
-                mutatingRows = false;
+                CompleteRowMutation();
             }
         }
 
@@ -654,12 +860,24 @@ namespace UniversalUtilities
 
             object[] values = GetRowValuesChecked(item, rowIndex);
             DataRow dataRow = dataTable.Rows[rowIndex];
-            dataRow.ItemArray = values;
-            rowItems[rowIndex] = item;
-            rowMap[dataRow] = item;
+            bool wasSelected = IsDataRowSelected(dataRow);
+            mutatingRows = true;
+            try
+            {
+                dataRow.ItemArray = values;
+                rowItems[rowIndex] = item;
+                rowMap[dataRow] = item;
+                rowUpdateTargets[rowIndex].Active = false;
+                rowUpdateTargets[rowIndex] = new RowUpdateTarget(dataRow);
+                selectionChangePending |= wasSelected;
+            }
+            finally
+            {
+                CompleteRowMutation();
+            }
             if (alarmColumnIndex >= 0)
             {
-                Invalidate();
+                InvalidateDataRow(dataRow);
             }
         }
 
@@ -672,6 +890,7 @@ namespace UniversalUtilities
         public IReadOnlyList<T> GetSelectedItems()
         {
             EnsureUiThread();
+            if (!mutatingRows) EnsureRowMapping(-1);
             var selected = new List<T>();
             if (mutatingRows || rowMap.Count == 0)
             {
@@ -726,17 +945,8 @@ namespace UniversalUtilities
             }
 
             DataRowView view = row.DataBoundItem as DataRowView;
-            if (view != null)
-            {
-                return rowMap.TryGetValue(view.Row, out item);
-            }
-
-            if (row.Index >= 0 && row.Index < rowItems.Count)
-            {
-                item = rowItems[row.Index];
-                return true;
-            }
-            return false;
+            if (view != null && rowMap.TryGetValue(view.Row, out item)) return true;
+            throw new InvalidOperationException("选中行的对象映射已失效；请使用控件行操作接口，不要直接替换 Table.Rows。");
         }
 
         /// <summary>同 <see cref="GetSelectedItems"/>；属性形式便于调用方直接读取。</summary>
@@ -765,6 +975,7 @@ namespace UniversalUtilities
                 try
                 {
                     dataTable.Rows.Clear();
+                    InvalidateRowUpdateTargets();
                     rowItems.Clear();
                     rowMap.Clear();
                 }
@@ -775,10 +986,62 @@ namespace UniversalUtilities
             }
             finally
             {
-                mutatingRows = false;
                 ResumeLayout(true);
+                CompleteRowMutation();
             }
             ForceFirstColumnVisible();
+        }
+
+        /// <summary>行操作期间合并选中通知，确保宿主读取到已完成的对象映射。</summary>
+        protected override void OnSelectionChanged(EventArgs e)
+        {
+            if (mutatingRows)
+            {
+                selectionChangePending = true;
+                return;
+            }
+            base.OnSelectionChanged(e);
+        }
+
+        /// <summary>派生类重写 OnSelectionChanged 时可用本属性跳过行操作中的中间状态。</summary>
+        protected bool IsUpdatingRows { get { return mutatingRows; } }
+
+        private void CompleteRowMutation()
+        {
+            Volatile.Write(ref publishedRowTargets, rowUpdateTargets.ToArray());
+            mutatingRows = false;
+            if (selectionChangePending)
+            {
+                selectionChangePending = false;
+                OnSelectionChanged(EventArgs.Empty);
+            }
+        }
+
+        private bool IsDataRowSelected(DataRow dataRow)
+        {
+            foreach (DataGridViewRow row in SelectedRows)
+                if ((row.DataBoundItem as DataRowView)?.Row == dataRow) return true;
+            if (SelectedRows.Count == 0)
+                foreach (DataGridViewCell cell in SelectedCells)
+                    if ((Rows[cell.RowIndex].DataBoundItem as DataRowView)?.Row == dataRow) return true;
+            return false;
+        }
+
+        private void InvalidateDataRow(DataRow dataRow)
+        {
+            int first, count;
+            if (!TryGetVisibleRowRange(out first, out count)) return;
+            for (int i = first; i < first + count; i++)
+                if ((Rows[i].DataBoundItem as DataRowView)?.Row == dataRow) InvalidateRow(i);
+        }
+
+        private void InvalidateRowUpdateTargets()
+        {
+            foreach (RowUpdateTarget target in rowUpdateTargets)
+            {
+                target.Active = false;
+            }
+            rowUpdateTargets.Clear();
         }
 
         /// <summary>
@@ -880,6 +1143,7 @@ namespace UniversalUtilities
         public IReadOnlyList<int> GetVisibleDataRowIndexes()
         {
             EnsureUiThread();
+            if (!mutatingRows) EnsureRowMapping(-1);
             var indexes = new List<int>();
             if (!IsHandleCreated || Rows.Count == 0)
             {
@@ -917,10 +1181,6 @@ namespace UniversalUtilities
                         indexes.Add(dataIndex);
                     }
                 }
-                else if (displayIndex < rowItems.Count && seen.Add(displayIndex))
-                {
-                    indexes.Add(displayIndex);
-                }
             }
             return indexes;
         }
@@ -941,7 +1201,7 @@ namespace UniversalUtilities
             ValidateColumnIndex(columnIndex);
             if (!TrySetCellCore(rowIndex, columnIndex, value))
             {
-                throw new ArgumentException(LastCellUpdateError, nameof(value));
+                throw new ArgumentException(LastCellUpdateError, nameof(value), lastCellUpdateException);
             }
         }
 
@@ -964,7 +1224,8 @@ namespace UniversalUtilities
         }
 
         /// <summary>
-        /// 尝试写入一个单元格（UI 线程）。索引越界或值不兼容时返回 <see langword="false"/>，不抛异常。
+        /// 尝试写入一个单元格（UI 线程）。索引越界、类型转换、只读列或约束失败返回 false 并记账。
+        /// 线程错误、外部破坏映射和非数据层程序异常仍会抛出。
         /// </summary>
         /// <param name="rowIndex">数据行索引（DataTable 数据顺序，不受显示排序影响）。</param>
         /// <param name="columnIndex">列索引。</param>
@@ -1001,7 +1262,7 @@ namespace UniversalUtilities
         }
 
         /// <summary>
-        /// 批量写入单元格（UI 线程）。越界或类型不兼容的项会被跳过并计数，不中断整批。
+        /// 批量写入单元格（UI 线程）。越界、类型转换、只读列及约束失败的项被跳过并计数，不中断整批。
         /// </summary>
         /// <param name="updates">要应用的更新；为 <see langword="null"/> 时直接返回 0。</param>
         /// <returns>成功写入的单元格数。</returns>
@@ -1046,8 +1307,47 @@ namespace UniversalUtilities
         /// 线程安全的单单元格更新入口：任意线程可调用，更新入队后由 UI 线程应用。
         /// </summary>
         /// <param name="update">单元格更新。</param>
-        /// <remarks>队列上限约 10 万条；满时丢弃并计入 <see cref="DroppedUpdateCount"/>。</remarks>
+        /// <remarks>
+        /// 行号按投递时的行快照解析；后续插入/删除不会改变目标，目标被删除、替换或重建后更新将丢弃。
+        /// 队列上限约 10 万条；丢弃计入 <see cref="DroppedUpdateCount"/>。调用方应使用当前数据行号投递。
+        /// </remarks>
         public void PostCellUpdate(CellUpdate update)
+        {
+            EnqueueUpdate(update, Volatile.Read(ref publishedRowTargets));
+        }
+
+        /// <summary>稳定的行句柄；可传给后台线程。删除、替换或重建该行后句柄失效。</summary>
+        public sealed class RowHandle
+        {
+            internal readonly object Owner;
+            internal readonly object Target;
+            internal RowHandle(object owner, object target) { Owner = owner; Target = target; }
+        }
+
+        /// <summary>在 UI 线程取得稳定行句柄，避免生产者缓存的旧行号在投递前发生错位。</summary>
+        public RowHandle GetRowHandle(int rowIndex)
+        {
+            EnsureUiThread();
+            ValidateRowIndex(rowIndex);
+            return new RowHandle(this, rowUpdateTargets[rowIndex]);
+        }
+
+        /// <summary>按稳定行句柄投递；插入、删除其它行或排序不改变目标，失效句柄计入丢弃。</summary>
+        public void PostCellUpdate(RowHandle row, int columnIndex, object value)
+        {
+            if (row == null) throw new ArgumentNullException(nameof(row));
+            if (!ReferenceEquals(row.Owner, this)) throw new ArgumentException("行句柄属于其它控件。", nameof(row));
+            EnqueueUpdate(new PendingCellUpdate((RowUpdateTarget)row.Target, new CellUpdate(-1, columnIndex, value)));
+        }
+
+        private void EnqueueUpdate(CellUpdate update, RowUpdateTarget[] targets)
+        {
+            RowUpdateTarget target = update.RowIndex >= 0 && update.RowIndex < targets.Length
+                ? targets[update.RowIndex] : null;
+            EnqueueUpdate(new PendingCellUpdate(target, update));
+        }
+
+        private void EnqueueUpdate(PendingCellUpdate update)
         {
             if (disposed || Disposing)
             {
@@ -1066,7 +1366,7 @@ namespace UniversalUtilities
         }
 
         /// <summary>
-        /// 线程安全的批量更新入口：任意线程可调用；内部逐条入队并只投递一次 UI 回调。
+        /// 线程安全的批量更新入口：任意线程可调用；整批使用同一份行快照，分批在 UI 线程应用。
         /// </summary>
         /// <param name="updates">要应用的更新集合；为 <see langword="null"/> 时什么都不做。</param>
         public void PostUpdates(IEnumerable<CellUpdate> updates)
@@ -1076,9 +1376,10 @@ namespace UniversalUtilities
                 return;
             }
 
+            RowUpdateTarget[] targets = Volatile.Read(ref publishedRowTargets);
             foreach (CellUpdate update in updates)
             {
-                PostCellUpdate(update);
+                EnqueueUpdate(update, targets);
             }
         }
 
@@ -1110,7 +1411,7 @@ namespace UniversalUtilities
             {
                 return false;
             }
-            if (IsColumnLocked(columnKey))
+            if (column.Index == 0 || IsColumnLocked(columnKey))
             {
                 return false;
             }
@@ -1159,14 +1460,15 @@ namespace UniversalUtilities
         /// 从 <see cref="LayoutFile"/> 读取布局并应用：按列键恢复列宽与显隐，并按文件中的列顺序恢复显示顺序。
         /// </summary>
         /// <returns>
-        /// 成功应用返回 <see langword="true"/>；未设置文件名、文件不存在、JSON 损坏或版本不支持返回
-        /// <see langword="false"/>，并把布局回退为“全部显示 + 默认列宽 + 定义顺序”。
+        /// 主文件不可用时尝试 .bak；成功返回 true，备份恢复记入 LastLayoutWarning。
+        /// 两者均不可用时返回 false，并回退为“全部显示 + 默认列宽 + 定义顺序”；未设置文件名时不更改界面。
         /// </returns>
         /// <remarks>前 <see cref="LockedColumnCount"/> 列始终强制可见；文件中缺失的列按默认宽度显示并排在已知列之后。</remarks>
         public bool LoadLayout()
         {
             EnsureUiThread();
             LastLayoutError = null;
+            LastLayoutWarning = null;
             if (string.IsNullOrEmpty(LayoutFile))
             {
                 return false;
@@ -1174,19 +1476,23 @@ namespace UniversalUtilities
 
             try
             {
-                if (!File.Exists(LayoutFile))
+                if (!File.Exists(LayoutFile) && !File.Exists(LayoutFile + ".bak"))
                 {
                     ApplyDefaults();
                     return false;
                 }
 
-                string json = File.ReadAllText(LayoutFile);
-                LayoutFileModel model = JsonConvert.DeserializeObject<LayoutFileModel>(json);
-                if (model == null || model.Version <= 0 || model.Version > LayoutFileVersion)
+                LayoutFileModel model;
+                try
                 {
-                    LastLayoutError = "布局文件版本无效（" + (model == null ? "null" : model.Version.ToString()) + "），已回退为全部显示。";
-                    ApplyDefaults();
-                    return false;
+                    model = ReadLayoutModel(LayoutFile);
+                }
+                catch (Exception primaryError) when (primaryError is IOException || primaryError is UnauthorizedAccessException
+                    || primaryError is JsonException || primaryError is InvalidDataException)
+                {
+                    if (!File.Exists(LayoutFile + ".bak")) throw;
+                    model = ReadLayoutModel(LayoutFile + ".bak");
+                    LastLayoutWarning = "主布局不可用，已从 .bak 恢复: " + primaryError.Message;
                 }
 
                 ApplyLayoutModel(model);
@@ -1203,6 +1509,14 @@ namespace UniversalUtilities
             }
         }
 
+        private static LayoutFileModel ReadLayoutModel(string path)
+        {
+            var model = JsonConvert.DeserializeObject<LayoutFileModel>(File.ReadAllText(path));
+            if (model == null || model.Version <= 0 || model.Version > LayoutFileVersion)
+                throw new InvalidDataException("布局文件版本无效。");
+            return model;
+        }
+
         /// <summary>
         /// 把当前的列宽、显隐与显示顺序写入 <see cref="LayoutFile"/>（版本 2；列宽为 96 DPI 逻辑像素，
         /// 加载时按 DeviceDpi/96 缩放；原子写入：临时文件 + 替换 + .bak 备份）。
@@ -1211,6 +1525,7 @@ namespace UniversalUtilities
         public bool SaveLayout()
         {
             EnsureUiThread();
+            RestoreLockedColumnOrder();
             LastLayoutError = null;
             if (string.IsNullOrEmpty(LayoutFile) || Columns.Count == 0)
             {
@@ -1220,25 +1535,14 @@ namespace UniversalUtilities
             savingLayout = true;
             try
             {
-                var model = new LayoutFileModel
-                {
-                    Version = LayoutFileVersion,
-                    Dpi = LogicalDpi,
-                    Columns = new List<LayoutColumnModel>(Columns.Count)
-                };
-                foreach (DataGridViewColumn column in GetColumnsInDisplayOrder())
-                {
-                    model.Columns.Add(new LayoutColumnModel
-                    {
-                        Key = column.Name,
-                        Visible = column.Visible,
-                        Width = ToLogicalWidth(GetBaseWidth(column))
-                    });
-                }
+                LayoutFileModel model = CaptureLayoutModel();
 
                 string json = JsonConvert.SerializeObject(model, Formatting.Indented);
                 WriteAllTextAtomic(LayoutFile, json);
+                LastLayoutWarning = null;
                 columnWidthSavePending = false;
+                layoutSaveRetryCount = 0;
+                columnWidthSaveTimer.Stop();
                 loadedLayout = model;
                 loadedLayoutDpi = DeviceDpi > 0 ? DeviceDpi : LogicalDpi;
                 widthsDpi = loadedLayoutDpi;
@@ -1257,6 +1561,16 @@ namespace UniversalUtilities
             }
         }
 
+        private LayoutFileModel CaptureLayoutModel()
+        {
+            var model = new LayoutFileModel { Version = LayoutFileVersion, Dpi = LogicalDpi,
+                Columns = new List<LayoutColumnModel>(Columns.Count) };
+            foreach (DataGridViewColumn column in GetColumnsInDisplayOrder())
+                model.Columns.Add(new LayoutColumnModel { Key = column.Name, Visible = column.Visible,
+                    Width = ToLogicalWidth(GetBaseWidth(column)) });
+            return model;
+        }
+
         /// <summary>
         /// 迁移旧版的“列宽 JSON（ID/width）+ 显隐 CSV（1/0）”到新的单文件布局。
         /// </summary>
@@ -1265,7 +1579,7 @@ namespace UniversalUtilities
         /// <returns>迁移并写入新布局成功返回 <see langword="true"/>；新布局已存在、旧文件不存在或读写失败返回 <see langword="false"/>。</returns>
         /// <remarks>
         /// 旧格式按“当前列顺序”映射（旧列宽是保存时 DPI 下的物理像素）；迁移后写为新版 96 DPI 逻辑宽度，
-        /// 成功后旧文件改名为 <c>*.bak</c>。
+        /// 先复制旧文件到 <c>*.bak</c>；新布局写入成功后清理旧文件，清理失败记入 LastLayoutWarning。
         /// 第一列始终强制可见。
         /// </remarks>
         public bool MigrateLegacyLayout(string legacyWidthFile, string legacyShownFile)
@@ -1291,79 +1605,105 @@ namespace UniversalUtilities
                 return false;
             }
 
-            loadingLayout = true;
+            LastLayoutWarning = null;
             try
             {
-                ApplyDefaultWidths();
-                ShowAllColumnsCore();
-
+                // 先解析并准备备份；应用/发布失败由事务辅助方法恢复原 UI 和保存状态。
+                LayoutFileModel model = CaptureLayoutModel();
+                var byKey = new Dictionary<string, LayoutColumnModel>(StringComparer.OrdinalIgnoreCase);
+                foreach (LayoutColumnModel column in model.Columns)
+                {
+                    column.Width = ToLogicalWidth(GetDefaultColumnWidth(column.Key));
+                    column.Visible = true;
+                    byKey.Add(column.Key, column);
+                }
                 if (hasWidth)
                 {
-                    string json = File.ReadAllText(legacyWidthFile);
-                    List<LegacyColumnWidthEntry> widths = JsonConvert.DeserializeObject<List<LegacyColumnWidthEntry>>(json);
+                    var widths = JsonConvert.DeserializeObject<List<LegacyColumnWidthEntry>>(File.ReadAllText(legacyWidthFile));
                     if (widths != null)
-                    {
                         foreach (LegacyColumnWidthEntry entry in widths)
-                        {
-                            if (entry == null || entry.ID < 0 || entry.ID >= Columns.Count || entry.Width <= 0)
-                            {
-                                continue;
-                            }
-
-                            int width = Math.Min(entry.Width, 65535);
-                            if (width < Columns[entry.ID].MinimumWidth)
-                            {
-                                width = Columns[entry.ID].MinimumWidth;
-                            }
-                            Columns[entry.ID].Width = width;
-                        }
-                    }
+                            if (entry != null && entry.ID >= 0 && entry.ID < Columns.Count && entry.Width > 0)
+                                byKey[Columns[entry.ID].Name].Width = ToLogicalWidth(Math.Max(Columns[entry.ID].MinimumWidth, Math.Min(entry.Width, 65535)));
                 }
-
                 if (hasShown)
                 {
-                    string content = File.ReadAllText(legacyShownFile);
-                    string[] parts = content.Split(',');
+                    string[] parts = File.ReadAllText(legacyShownFile).Split(',');
                     for (int i = 0; i < parts.Length && i < Columns.Count; i++)
-                    {
-                        if (parts[i].Trim() == "0")
-                        {
-                            Columns[i].Visible = false;
-                        }
-                    }
+                        byKey[Columns[i].Name].Visible = parts[i].Trim() != "0" || i == 0 || IsColumnLocked(Columns[i].Name);
                 }
+                // 备份失败必须报告失败，并保留旧文件和原界面。
+                if (hasWidth) File.Copy(legacyWidthFile, legacyWidthFile + ".bak", true);
+                if (hasShown) File.Copy(legacyShownFile, legacyShownFile + ".bak", true);
+                ApplyAndPublishMigratedLayout(model);
+                loadedLayout = model;
+                columnWidthSavePending = false;
+                columnWidthSaveTimer.Stop();
+                try
+                {
+                    if (hasWidth) File.Delete(legacyWidthFile);
+                    if (hasShown) File.Delete(legacyShownFile);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    LastLayoutWarning = "布局已迁移并备份，但旧文件清理失败: " + ex.Message;
+                }
+                return true;
             }
             catch (Exception ex)
             {
                 LastLayoutError = "迁移旧布局失败: " + ex.Message;
-                Log.WriteLog(LastLayoutError, "Layout", "IndustrialDataGridView");
                 return false;
             }
-            finally
-            {
-                loadingLayout = false;
-            }
-
-            foreach (DataGridViewColumn column in Columns)
-            {
-                SetBaseWidth(column, column.Width);
-            }
-            AutoFitColumnHeaders();
-            ForceFirstColumnVisible();
-            if (!SaveLayout())
-            {
-                if (string.IsNullOrEmpty(LastLayoutError))
-                {
-                    LastLayoutError = "迁移后写入新布局失败。";
-                }
-                return false;
-            }
-
-            BackupLegacyFile(legacyWidthFile, hasWidth);
-            BackupLegacyFile(legacyShownFile, hasShown);
-            return true;
         }
 
+        private void ApplyAndPublishMigratedLayout(LayoutFileModel model)
+        {
+            LayoutFileModel previous = CaptureLayoutModel();
+            LayoutFileModel previousLoaded = loadedLayout;
+            int previousLoadedDpi = loadedLayoutDpi, previousWidthsDpi = widthsDpi;
+            bool previousDirty = layoutWidthsChangedByUser, previousPending = columnWidthSavePending;
+            bool previousTimer = columnWidthSaveTimer.Enabled;
+            int previousInterval = columnWidthSaveTimer.Interval, previousRetry = layoutSaveRetryCount;
+            var minimums = new int[Columns.Count];
+            var physicalWidths = new int[Columns.Count];
+            var previousBaseWidths = new Dictionary<string, int>(baseColumnWidths, StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < Columns.Count; i++) { minimums[i] = Columns[i].MinimumWidth; physicalWidths[i] = Columns[i].Width; }
+            columnWidthSaveTimer.Stop();
+            try
+            {
+                ApplyLayoutModel(model);
+                // 仅应用成功才发布新文件；目标若被其它调用创建，禁止覆盖。
+                WriteAllTextAtomic(LayoutFile, JsonConvert.SerializeObject(model, Formatting.Indented), false);
+            }
+            catch (Exception applyError)
+            {
+                try
+                {
+                    ApplyLayoutModel(previous);
+                    loadingLayout = true;
+                    for (int i = 0; i < Columns.Count; i++)
+                    {
+                        Columns[i].MinimumWidth = minimums[i];
+                        Columns[i].Width = physicalWidths[i];
+                    }
+                }
+                catch (Exception rollbackError)
+                {
+                    throw new InvalidOperationException(applyError.Message + "；恢复原布局也失败: " + rollbackError.Message, applyError);
+                }
+                finally
+                {
+                    loadingLayout = false;
+                    loadedLayout = previousLoaded; loadedLayoutDpi = previousLoadedDpi; widthsDpi = previousWidthsDpi;
+                    baseColumnWidths.Clear();
+                    foreach (var width in previousBaseWidths) baseColumnWidths.Add(width.Key, width.Value);
+                    layoutWidthsChangedByUser = previousDirty; columnWidthSavePending = previousPending;
+                    layoutSaveRetryCount = previousRetry; columnWidthSaveTimer.Interval = previousInterval;
+                    if (previousTimer) columnWidthSaveTimer.Start();
+                }
+                throw;
+            }
+        }
         /// <summary>把字号放大 0.5 磅（上限 <see cref="MaxFontSize"/>），并同步刷新可见行高与行模板。</summary>
         public void IncreaseFont()
         {
@@ -1437,6 +1777,7 @@ namespace UniversalUtilities
             base.OnFontChanged(e);
             UpdateRowHeights();
             AutoFitColumnHeaders();
+            styleMetricsPending = false;
         }
 
         /// <summary>DPI 变化时重新计算行高；若布局已加载且用户未改过列宽，则按新 DPI 重新套用列宽。</summary>
@@ -1460,6 +1801,7 @@ namespace UniversalUtilities
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+            RestoreLockedColumnOrder();
             UpdateRowHeights();
             if (loadedLayout != null && !layoutWidthsChangedByUser && loadedLayout.Dpi > 0)
             {
@@ -1479,6 +1821,8 @@ namespace UniversalUtilities
         /// <param name="e">事件参数。</param>
         protected override void OnHandleDestroyed(EventArgs e)
         {
+            styleMetricsPending = false;
+            drainTimer.Stop();
             Interlocked.Exchange(ref drainScheduled, 0);
             base.OnHandleDestroyed(e);
         }
@@ -1491,11 +1835,15 @@ namespace UniversalUtilities
         {
             if (disposing)
             {
+                // 用户换序后可能尚未处理延后恢复消息，关闭前仍需保存最终合法布局。
+                RestoreLockedColumnOrder();
                 disposed = true;
                 try
                 {
                     columnWidthSaveTimer.Stop();
                     columnWidthSaveTimer.Dispose();
+                    drainTimer.Stop();
+                    drainTimer.Dispose();
                 }
                 catch (Exception)
                 {
@@ -1513,11 +1861,14 @@ namespace UniversalUtilities
                     columnWidthSavePending = false;
                 }
 
-                CellUpdate update;
+                InvalidateRowUpdateTargets();
+                Volatile.Write(ref publishedRowTargets, new RowUpdateTarget[0]);
+                PendingCellUpdate update;
                 while (pendingUpdates.TryDequeue(out update))
                 {
                 }
                 Interlocked.Exchange(ref pendingUpdateCount, 0);
+                conversionTable?.Dispose();
             }
 
             base.Dispose(disposing);
@@ -1604,6 +1955,9 @@ namespace UniversalUtilities
             ownedFonts.Add(initialFont);
             appliedFont = initialFont;
             Font = initialFont;
+            // 补齐默认样式的继承值，避免框架 getter 每次返回临时副本，
+            // 导致宿主通过 DefaultCellStyle.Font/Padding 设置的值丢失。
+            DefaultCellStyle = DefaultCellStyle;
         }
 
         private void CreateColumns()
@@ -1702,18 +2056,42 @@ namespace UniversalUtilities
             }
 
             var copy = new object[values.Length];
-            Array.Copy(values, copy, values.Length);
+            for (int i = 0; i < values.Length; i++)
+            {
+                copy[i] = values[i] ?? DBNull.Value;
+            }
             return copy;
         }
 
         private bool IsValidCell(int rowIndex, int columnIndex)
         {
+            EnsureRowMapping(rowIndex);
             return rowIndex >= 0 && rowIndex < dataTable.Rows.Count
                 && columnIndex >= 0 && columnIndex < dataTable.Columns.Count;
         }
 
+        private void EnsureRowMapping(int rowIndex)
+        {
+            EnsureSupportedForeignKeys();
+            if (!ReferenceEquals(DataSource, dataTable) || dataTable.Rows.Count != rowItems.Count
+                || rowUpdateTargets.Count != rowItems.Count || dataTable.Columns.Count != columnDefinitions.Length
+                || Columns.Count != columnDefinitions.Length
+                || (rowIndex >= 0 && rowIndex < rowUpdateTargets.Count
+                    && !ReferenceEquals(rowUpdateTargets[rowIndex].Row, dataTable.Rows[rowIndex])))
+                throw new InvalidOperationException("数据绑定或行列集合被外部修改；请使用控件的行操作接口，保持固定列和原 DataSource。");
+            if (rowMappingNeedsValidation)
+            {
+                for (int i = 0; i < rowItems.Count; i++)
+                    if (!ReferenceEquals(rowUpdateTargets[i].Row, dataTable.Rows[i])
+                        || dataTable.Rows[i].RowState == DataRowState.Deleted || !rowMap.ContainsKey(dataTable.Rows[i]))
+                        throw new InvalidOperationException("数据行被外部替换或删除；请使用控件的行操作接口维护对象映射。");
+                rowMappingNeedsValidation = false;
+            }
+        }
+
         private void ValidateRowIndex(int rowIndex)
         {
+            EnsureRowMapping(rowIndex);
             if (rowIndex < 0 || rowIndex >= dataTable.Rows.Count)
             {
                 throw new ArgumentOutOfRangeException(
@@ -1734,18 +2112,30 @@ namespace UniversalUtilities
 
         private bool TrySetCellCore(int rowIndex, int columnIndex, object value)
         {
+            return TrySetCellCore(dataTable.Rows[rowIndex], rowIndex, columnIndex, value);
+        }
+
+        private bool TrySetCellCore(DataRow row, int rowIndex, int columnIndex, object value)
+        {
+            // 后台队列不经过 ValidateRowIndex；不支持的外键配置也须记失败，避免静默接受。
+            try { EnsureSupportedForeignKeys(); }
+            catch (InvalidOperationException ex) { RecordCellError(ex.Message, ex); return false; }
             try
             {
-                object oldAlarmValue = columnIndex == alarmColumnIndex
-                    ? dataTable.Rows[rowIndex][columnIndex]
-                    : null;
-                dataTable.Rows[rowIndex][columnIndex] = value;
+                value = value ?? DBNull.Value;
+                value = NormalizeCellValue(columnIndex, value);
+                object oldValue = row[columnIndex];
+                if (object.Equals(oldValue, value))
+                {
+                    return true;
+                }
+                row[columnIndex] = value;
                 if (columnIndex == alarmColumnIndex)
                 {
-                    object newAlarmValue = dataTable.Rows[rowIndex][columnIndex];
-                    if (!AlarmValuesEqual(oldAlarmValue, newAlarmValue))
+                    object newAlarmValue = row[columnIndex];
+                    if (!AlarmValuesEqual(oldValue, newAlarmValue))
                     {
-                        Invalidate();
+                        InvalidateDataRow(row);
                     }
                 }
                 return true;
@@ -1753,9 +2143,35 @@ namespace UniversalUtilities
             catch (Exception ex) when (IsCellValueException(ex))
             {
                 RecordCellError(
-                    "行 " + rowIndex + " 列 " + columnIndex + " 写入 " + DescribeValue(value) + " 失败: " + ex.Message);
+                    "行 " + rowIndex + " 列 " + columnIndex + " 写入 " + DescribeValue(value) + " 失败: " + ex.Message, ex);
                 return false;
             }
+        }
+
+        private object NormalizeCellValue(int columnIndex, object value)
+        {
+            DataColumn column = dataTable.Columns[columnIndex];
+            if (value == DBNull.Value || (column.DataType.IsInstanceOfType(value) && column.DataType != typeof(DateTime))) return value;
+            // 使用未绑定、无约束的 DataColumn 转换，保持字符串、日期、Guid、TimeSpan、
+            // SQL 类型等与 DataTable 完全相同的规则；不向实际绑定表发送试写通知。
+            if (conversionTable != null && column.DataType == typeof(DateTime)
+                && conversionTable.Columns[columnIndex].DateTimeMode != column.DateTimeMode)
+            {
+                conversionTable.Dispose(); conversionTable = null;
+            }
+            if (conversionTable == null)
+            {
+                conversionTable = new DataTable();
+                foreach (DataColumn source in dataTable.Columns)
+                {
+                    DataColumn target = conversionTable.Columns.Add(source.ColumnName, source.DataType);
+                    if (source.DataType == typeof(DateTime)) target.DateTimeMode = source.DateTimeMode;
+                }
+                conversionRow = conversionTable.NewRow();
+            }
+            conversionTable.Locale = dataTable.Locale;
+            try { conversionRow[columnIndex] = value; return conversionRow[columnIndex]; }
+            finally { conversionRow[columnIndex] = DBNull.Value; }
         }
 
         private static bool AlarmValuesEqual(object oldValue, object newValue)
@@ -1777,9 +2193,7 @@ namespace UniversalUtilities
                 || ex is FormatException
                 || ex is InvalidCastException
                 || ex is OverflowException
-                || ex is ConstraintException
-                || ex is NoNullAllowedException
-                || ex is DeletedRowInaccessibleException;
+                || ex is DataException;
         }
 
         private static string DescribeValue(object value)
@@ -1797,9 +2211,10 @@ namespace UniversalUtilities
             return text;
         }
 
-        private void RecordCellError(string message)
+        private void RecordCellError(string message, Exception exception = null)
         {
             LastCellUpdateError = message;
+            lastCellUpdateException = exception;
             Interlocked.Increment(ref failedCellUpdateCount);
         }
 
@@ -1841,26 +2256,66 @@ namespace UniversalUtilities
 
         private void DrainPending()
         {
-            Interlocked.Exchange(ref drainScheduled, 0);
             if (disposed || Disposing)
             {
                 return;
             }
+            if (mutatingRows)
+            {
+                drainTimer.Start();
+                return;
+            }
 
             int failed = 0;
-            CellUpdate update;
-            while (pendingUpdates.TryDequeue(out update))
+            var watch = Stopwatch.StartNew();
+            try
             {
-                Interlocked.Decrement(ref pendingUpdateCount);
-                if (!IsValidCell(update.RowIndex, update.ColumnIndex))
+                PendingCellUpdate pending;
+                int processed = 0;
+                while (processed < MaxDrainBatchSize && watch.ElapsedMilliseconds < DrainTimeBudgetMs
+                    && pendingUpdates.TryDequeue(out pending))
                 {
-                    RecordCellError("单元格索引越界: 行 " + update.RowIndex + ", 列 " + update.ColumnIndex);
-                    failed++;
-                    continue;
+                    processed++;
+                    Interlocked.Decrement(ref pendingUpdateCount);
+                    CellUpdate update = pending.Update;
+                    if (pending.Target == null || update.ColumnIndex < 0 || update.ColumnIndex >= dataTable.Columns.Count)
+                    {
+                        RecordCellError("单元格索引越界: 行 " + update.RowIndex + ", 列 " + update.ColumnIndex);
+                        failed++;
+                        continue;
+                    }
+                    if (!pending.Target.Active)
+                    {
+                        Interlocked.Increment(ref droppedUpdateCount);
+                        continue;
+                    }
+                    if (pending.Target.Row.RowState == DataRowState.Detached || !ReferenceEquals(DataSource, dataTable))
+                    {
+                        RecordCellError("目标行或数据绑定被外部修改，更新未应用。");
+                        failed++;
+                        continue;
+                    }
+                    if (!TrySetCellCore(pending.Target.Row, update.RowIndex, update.ColumnIndex, update.Value))
+                    {
+                        failed++;
+                    }
                 }
-                if (!TrySetCellCore(update.RowIndex, update.ColumnIndex, update.Value))
+            }
+            finally
+            {
+                if (!disposed && IsHandleCreated && !pendingUpdates.IsEmpty)
                 {
-                    failed++;
+                    // BeginInvoke 会在同一轮 WinForms 消息中继续执行新回调。
+                    // 后续批次通过定时器让出消息循环，允许输入和绘制先执行。
+                    drainTimer.Start();
+                }
+                else
+                {
+                    Interlocked.Exchange(ref drainScheduled, 0);
+                    if (!pendingUpdates.IsEmpty)
+                    {
+                        ScheduleDrain();
+                    }
                 }
             }
 
@@ -1868,9 +2323,24 @@ namespace UniversalUtilities
             {
                 LogCellErrors(failed);
             }
-            if (Volatile.Read(ref pendingUpdateCount) > 0)
+        }
+
+        // 后台只读取不可变的行快照/目标引用；DataRow 和 Active 仅由 UI 线程访问。
+        private sealed class RowUpdateTarget
+        {
+            public readonly DataRow Row;
+            public bool Active = true;
+            public RowUpdateTarget(DataRow row) { Row = row; }
+        }
+
+        private readonly struct PendingCellUpdate
+        {
+            public readonly RowUpdateTarget Target;
+            public readonly CellUpdate Update;
+            public PendingCellUpdate(RowUpdateTarget target, CellUpdate update)
             {
-                ScheduleDrain();
+                Target = target;
+                Update = update;
             }
         }
 
@@ -1885,6 +2355,7 @@ namespace UniversalUtilities
 
         private void ForceFirstColumnVisible()
         {
+            if (Columns.Count > 0) Columns[0].Visible = true;
             foreach (DataGridViewColumn column in lockedColumns)
             {
                 if (!column.Visible)
@@ -1896,6 +2367,7 @@ namespace UniversalUtilities
 
         private void ResetColumnOrderToDefinitions()
         {
+            UnfreezeColumns();
             var ordered = new List<DataGridViewColumn>(Columns.Count);
             var seen = new HashSet<DataGridViewColumn>();
             foreach (ColumnStruct definition in columnDefinitions)
@@ -1924,6 +2396,7 @@ namespace UniversalUtilities
 
         private void ApplyDefaults()
         {
+            lockedColumnRestorePending = false;
             loadingLayout = true;
             try
             {
@@ -1970,11 +2443,13 @@ namespace UniversalUtilities
             AutoFitColumnHeaders();
         }
 
-        private void ApplyLayoutModel(LayoutFileModel model)
+        private void ApplyLayoutModel(LayoutFileModel model, bool widthsOnly = false)
         {
+            if (!widthsOnly) lockedColumnRestorePending = false;
             loadingLayout = true;
             try
             {
+                if (!widthsOnly) UnfreezeColumns();
                 var layoutByKey = new Dictionary<string, LayoutColumnModel>(StringComparer.OrdinalIgnoreCase);
                 if (model.Columns != null)
                 {
@@ -1994,6 +2469,7 @@ namespace UniversalUtilities
                     : (model.Dpi > 0 ? model.Dpi : currentDpi);
                 foreach (DataGridViewColumn column in Columns)
                 {
+                    column.MinimumWidth = GetColumnMinimumWidth(column.Name, currentDpi);
                     LayoutColumnModel layout;
                     if (layoutByKey.TryGetValue(column.Name, out layout))
                     {
@@ -2002,17 +2478,22 @@ namespace UniversalUtilities
                             column.Width = ScaleWidth(layout.Width, sourceDpi, currentDpi, column.MinimumWidth);
                         }
                         SetBaseWidth(column, column.Width);
-                        column.Visible = layout.Visible;
+                        if (!widthsOnly) column.Visible = layout.Visible ?? true;
                     }
                     else
                     {
-                        column.Visible = true;
+                        if (!widthsOnly) column.Visible = true;
                         int defaultWidth = GetDefaultColumnWidth(column.Name);
                         column.Width = defaultWidth;
                         SetBaseWidth(column, defaultWidth);
                     }
                 }
 
+                if (widthsOnly)
+                {
+                    AutoFitColumnHeaders();
+                    return;
+                }
                 var ordered = new List<DataGridViewColumn>(Columns.Count);
                 var seen = new HashSet<DataGridViewColumn>();
                 if (model.Columns != null)
@@ -2073,7 +2554,7 @@ namespace UniversalUtilities
 
             try
             {
-                ApplyLayoutModel(loadedLayout);
+                ApplyLayoutModel(loadedLayout, true);
             }
             catch (Exception ex)
             {
@@ -2097,6 +2578,13 @@ namespace UniversalUtilities
             int dpi = DeviceDpi > 0 ? DeviceDpi : LogicalDpi;
             int minimum = ScaleWidth(logicalMinimum, LogicalDpi, dpi, 1);
             return ScaleWidth(logicalWidth, LogicalDpi, dpi, minimum);
+        }
+
+        private int GetColumnMinimumWidth(string key, int dpi)
+        {
+            int index = GetColumnIndex(key);
+            int minimum = index >= 0 ? columnDefinitions[index].minimumWidth : 0;
+            return ScaleWidth(minimum > 0 ? minimum : DefaultMinimumColumnWidth, LogicalDpi, dpi, 1);
         }
 
         /// <summary>
@@ -2146,10 +2634,10 @@ namespace UniversalUtilities
                 font,
                 new Size(10000, 10000),
                 TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-            int padding = 18;
+            int padding = ScaleWidth(18, LogicalDpi, DeviceDpi, 1) + column.HeaderCell.InheritedStyle.Padding.Horizontal;
             if (column.SortMode == DataGridViewColumnSortMode.Automatic)
             {
-                padding += 18;
+                padding += ScaleWidth(18, LogicalDpi, DeviceDpi, 1);
             }
             return Math.Min(65535, Math.Max(1, size.Width + padding));
         }
@@ -2401,7 +2889,9 @@ namespace UniversalUtilities
 
             layoutWidthsChangedByUser = true;
             columnWidthSavePending = true;
+            layoutSaveRetryCount = 0;
             columnWidthSaveTimer.Stop();
+            columnWidthSaveTimer.Interval = ColumnWidthSaveDelayMs;
             columnWidthSaveTimer.Start();
         }
 
@@ -2412,8 +2902,35 @@ namespace UniversalUtilities
                 return;
             }
 
+            if (lockedColumnRestorePending)
+            {
+                return;
+            }
+            lockedColumnRestorePending = true;
+            if (IsHandleCreated)
+            {
+                BeginInvoke(new Action(RestoreLockedColumnOrder));
+            }
+            // 无句柄时在 OnHandleCreated / SaveLayout 中恢复，不能在此事件内再次调整 DisplayIndex。
+        }
+
+        private void RestoreLockedColumnOrder()
+        {
+            if (disposed || !lockedColumnRestorePending)
+            {
+                return;
+            }
+            lockedColumnRestorePending = false;
             EnforceLockedColumnOrder();
             ScheduleLayoutSave();
+        }
+
+        private void UnfreezeColumns()
+        {
+            foreach (DataGridViewColumn column in Columns)
+            {
+                column.Frozen = false;
+            }
         }
 
         private void OnColumnStateChangedInternal(object sender, DataGridViewColumnStateChangedEventArgs e)
@@ -2457,6 +2974,11 @@ namespace UniversalUtilities
                     enforcingLockedColumns = false;
                 }
             }
+            if ((e.StateChanged & DataGridViewElementStates.Visible) != 0)
+            {
+                ForceFirstColumnVisible();
+                ScheduleLayoutSave();
+            }
         }
 
         private void OnCellFormattingInternal(object sender, DataGridViewCellFormattingEventArgs e)
@@ -2475,30 +2997,15 @@ namespace UniversalUtilities
             }
             else
             {
-                if (e.RowIndex >= dataTable.Rows.Count)
-                {
-                    return;
-                }
-                alarm = IsAlarmRowCore(dataTable.Rows[e.RowIndex]);
+                return;
             }
 
             if (alarm)
             {
                 e.CellStyle.BackColor = alarmRowBackColor;
                 e.CellStyle.ForeColor = alarmRowForeColor;
-                e.CellStyle.SelectionBackColor = alarmRowSelectedBackColor.IsEmpty
-                    ? DefaultCellStyle.SelectionBackColor
-                    : alarmRowSelectedBackColor;
-                e.CellStyle.SelectionForeColor = alarmRowSelectedForeColor.IsEmpty
-                    ? DefaultCellStyle.SelectionForeColor
-                    : alarmRowSelectedForeColor;
-            }
-            else
-            {
-                e.CellStyle.BackColor = DefaultCellStyle.BackColor;
-                e.CellStyle.ForeColor = DefaultCellStyle.ForeColor;
-                e.CellStyle.SelectionBackColor = DefaultCellStyle.SelectionBackColor;
-                e.CellStyle.SelectionForeColor = DefaultCellStyle.SelectionForeColor;
+                if (!alarmRowSelectedBackColor.IsEmpty) e.CellStyle.SelectionBackColor = alarmRowSelectedBackColor;
+                if (!alarmRowSelectedForeColor.IsEmpty) e.CellStyle.SelectionForeColor = alarmRowSelectedForeColor;
             }
         }
 
@@ -2524,6 +3031,11 @@ namespace UniversalUtilities
             if (SaveLayout())
             {
                 columnWidthSavePending = false;
+            }
+            else if (!disposed && ++layoutSaveRetryCount <= 3)
+            {
+                columnWidthSaveTimer.Interval = ColumnWidthSaveDelayMs * (1 << layoutSaveRetryCount);
+                columnWidthSaveTimer.Start();
             }
         }
 
@@ -2558,15 +3070,102 @@ namespace UniversalUtilities
         private int ComputeRowHeight()
         {
             int dpi = DeviceDpi > 0 ? DeviceDpi : 96;
-            int height = (int)Math.Ceiling(Font.GetHeight(dpi)) + RowHeightPadding;
-            return height < 1 ? 1 : height;
+            int height = 0;
+            var fontHeights = new Dictionary<Font, int>();
+            foreach (DataGridViewColumn column in Columns)
+                if (column.Visible)
+                    for (int parity = 0; parity < 2; parity++)
+                    {
+                        // 字体和 Padding 各自按继承顺序合并，不依赖“列是否自定义字体”。
+                        Font font = DefaultCellStyle.Font ?? Font;
+                        Padding padding = DefaultCellStyle.Padding;
+                        ApplyHeightStyle(column.DefaultCellStyle, ref font, ref padding);
+                        ApplyHeightStyle(RowsDefaultCellStyle, ref font, ref padding);
+                        if (parity == 1) ApplyHeightStyle(AlternatingRowsDefaultCellStyle, ref font, ref padding);
+                        ApplyHeightStyle(RowTemplate.DefaultCellStyle, ref font, ref padding);
+                        height = Math.Max(height, MeasureFontHeight(font, dpi, fontHeights) + padding.Vertical);
+                    }
+            if (height == 0) height = (int)Math.Ceiling(Font.GetHeight(dpi));
+            return Math.Max(RowTemplate.MinimumHeight, height + ScaleWidth(RowHeightPadding, LogicalDpi, dpi, 1));
+        }
+
+        private static void ApplyHeightStyle(DataGridViewCellStyle style, ref Font font, ref Padding padding)
+        {
+            if (style.Font != null) font = style.Font;
+            if (style.Padding != Padding.Empty) padding = style.Padding;
+        }
+
+        private static int MeasureFontHeight(Font font, int dpi, Dictionary<Font, int> cache)
+        {
+            int height;
+            if (!cache.TryGetValue(font, out height))
+            {
+                height = (int)Math.Ceiling(font.GetHeight(dpi)); cache.Add(font, height);
+            }
+            return height;
+        }
+
+        private void OnRowsAddedInitializeHeight(object sender, DataGridViewRowsAddedEventArgs e)
+        {
+            if (disposed) return;
+            int height = ComputeRowHeight();
+            RowTemplate.Height = height;
+            for (int i = e.RowIndex; i < e.RowIndex + e.RowCount && i < Rows.Count; i++)
+            {
+                int target = Math.Max(height, Rows[i].MinimumHeight);
+                if (Rows[i].Height != target) Rows[i].Height = target;
+            }
         }
 
         private int ComputeHeaderHeight()
         {
             int dpi = DeviceDpi > 0 ? DeviceDpi : 96;
-            int height = (int)Math.Ceiling(Font.GetHeight(dpi)) + HeaderHeightPadding;
-            return height < 1 ? 1 : height;
+            int height = (int)Math.Ceiling((ColumnHeadersDefaultCellStyle.Font ?? Font).GetHeight(dpi))
+                + ColumnHeadersDefaultCellStyle.Padding.Vertical;
+            foreach (DataGridViewColumn column in Columns)
+                if (column.Visible)
+                {
+                    DataGridViewCellStyle style = column.HeaderCell.InheritedStyle;
+                    height = Math.Max(height, (int)Math.Ceiling((style.Font ?? Font).GetHeight(dpi)) + style.Padding.Vertical);
+                }
+            return Math.Max(4, height + ScaleWidth(HeaderHeightPadding, LogicalDpi, dpi, 1));
+        }
+
+        private void ScheduleStyleMetrics()
+        {
+            // 同一轮多处样式调整只测量一次，避免在框架样式事件中重入布局。
+            if (disposed || !IsHandleCreated || styleMetricsPending || updatingStyleMetrics) return;
+            styleMetricsPending = true;
+            BeginInvoke(new Action(() => {
+                if (!styleMetricsPending) return;
+                styleMetricsPending = false;
+                UpdateStyleMetrics();
+            }));
+        }
+
+        private void UpdateStyleMetrics()
+        {
+            if (disposed || updatingStyleMetrics) return;
+            updatingStyleMetrics = true;
+            try { UpdateRowHeights(); AutoFitColumnHeaders(); }
+            finally { updatingStyleMetrics = false; }
+        }
+
+        private int ComputeVisibleRowHeight(DataGridViewRow row, int baseHeight, Dictionary<Font, int> fontHeights)
+        {
+            int height = Math.Max(baseHeight, row.MinimumHeight);
+            int dpi = DeviceDpi > 0 ? DeviceDpi : LogicalDpi;
+            bool customRow = row.HasDefaultCellStyle && (row.DefaultCellStyle.Font != null || row.DefaultCellStyle.Padding != Padding.Empty);
+            foreach (DataGridViewColumn column in Columns)
+                if (column.Visible)
+                {
+                    // 通常全表共用列/行默认样式，模板高度已覆盖；仅自定义行/单元格需要完整继承样式。
+                    if (!customRow && !row.Cells[column.Index].HasStyle) continue;
+                    DataGridViewCellStyle style = row.Cells[column.Index].InheritedStyle;
+                    height = Math.Max(height, MeasureFontHeight(style.Font ?? Font, dpi, fontHeights)
+                        + style.Padding.Vertical + ScaleWidth(RowHeightPadding, LogicalDpi, dpi, 1));
+                }
+            return height;
         }
 
         private void UpdateRowHeights()
@@ -2603,39 +3202,53 @@ namespace UniversalUtilities
         /// <param name="height">目标行高（像素）。</param>
         private void UpdateVisibleRowHeights(int height)
         {
-            if (disposed || !IsHandleCreated || Rows.Count == 0)
+            if (disposed || updatingRowHeights || !IsHandleCreated || Rows.Count == 0)
             {
                 return;
             }
-
-            int first;
-            int count;
-            if (!TryGetVisibleRowRange(out first, out count))
-            {
-                return;
-            }
-
-            int last = Math.Min(Rows.Count, first + count);
+            updatingRowHeights = true;
+            var fontHeights = new Dictionary<Font, int>();
             SuspendLayout();
             try
             {
-                for (int i = first; i < last; i++)
+                // 缩小行高会露出更多行；反复计算范围，直到可见区稳定。
+                for (int pass = 0; pass <= Rows.Count; pass++)
                 {
-                    if (Rows[i].Height != height)
+                    int first;
+                    int count;
+                    if (!TryGetVisibleRowRange(out first, out count))
                     {
-                        Rows[i].Height = height;
+                        break;
+                    }
+                    bool changed = false;
+                    int last = Math.Min(Rows.Count, first + count);
+                    for (int i = first; i < last; i++)
+                    {
+                        int target = ComputeVisibleRowHeight(Rows[i], height, fontHeights);
+                        int previous = Rows[i].Height;
+                        if (previous != target)
+                        {
+                            Rows[i].Height = target;
+                            changed |= Rows[i].Height != previous;
+                        }
+                    }
+                    if (!changed)
+                    {
+                        break;
                     }
                 }
             }
             finally
             {
                 ResumeLayout();
+                updatingRowHeights = false;
             }
         }
 
         private void OnScrollUpdateRowHeights(object sender, ScrollEventArgs e)
         {
-            UpdateVisibleRowHeights(ComputeRowHeight());
+            if (e.ScrollOrientation == ScrollOrientation.VerticalScroll)
+                UpdateVisibleRowHeights(ComputeRowHeight());
         }
 
         private void OnResizeUpdateRowHeights(object sender, EventArgs e)
@@ -2643,7 +3256,7 @@ namespace UniversalUtilities
             UpdateVisibleRowHeights(ComputeRowHeight());
         }
 
-        private static void WriteAllTextAtomic(string path, string content)
+        private static void WriteAllTextAtomic(string path, string content, bool overwrite = true)
         {
             string fullPath = Path.GetFullPath(path);
             string directory = Path.GetDirectoryName(fullPath);
@@ -2652,21 +3265,14 @@ namespace UniversalUtilities
                 Directory.CreateDirectory(directory);
             }
 
-            string tempPath = fullPath + ".tmp";
+            string tempPath = fullPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
                 File.WriteAllText(tempPath, content, new UTF8Encoding(false));
-                if (File.Exists(fullPath))
+                if (overwrite && File.Exists(fullPath))
                 {
-                    try
-                    {
-                        File.Replace(tempPath, fullPath, fullPath + ".bak", true);
-                    }
-                    catch (Exception)
-                    {
-                        File.Copy(tempPath, fullPath, true);
-                        File.Delete(tempPath);
-                    }
+                    // 替换不受支持或被锁定时报告失败，不能降级为会截断原文件的复制。
+                    File.Replace(tempPath, fullPath, fullPath + ".bak", true);
                 }
                 else
                 {
@@ -2685,24 +3291,6 @@ namespace UniversalUtilities
                     {
                     }
                 }
-            }
-        }
-
-        private static void BackupLegacyFile(string path, bool exists)
-        {
-            if (!exists || string.IsNullOrEmpty(path))
-            {
-                return;
-            }
-
-            try
-            {
-                File.Copy(path, path + ".bak", true);
-                File.Delete(path);
-            }
-            catch (Exception ex)
-            {
-                Log.WriteLog("备份旧布局失败(" + path + "): " + ex.Message, "Layout", "IndustrialDataGridView");
             }
         }
 
@@ -2745,7 +3333,7 @@ namespace UniversalUtilities
             public string Key { get; set; }
 
             [JsonProperty("visible")]
-            public bool Visible { get; set; }
+            public bool? Visible { get; set; }
 
             [JsonProperty("width")]
             public int Width { get; set; }

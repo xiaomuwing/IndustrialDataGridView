@@ -47,6 +47,52 @@ namespace IndustrialDataGridView.Demo
             };
         }
 
+        internal static List<CellUpdate> Simulate(List<DemoRow> rows, int[] visibleDataRows, int[] liveColumns, long cycle)
+        {
+            HashSet<int> visible = visibleDataRows == null ? null : new HashSet<int>(visibleDataRows);
+            var updates = new List<CellUpdate>(rows.Count + (visible == null ? rows.Count : visibleDataRows.Length) * (liveColumns.Length - 1));
+
+            for (int i = 0; i < rows.Count; i++)
+            {
+                DemoRow row = rows[i];
+                double phase = cycle * 0.08 + i * 0.17;
+                double raw = 100 + (i % 20) * 10 + 15 * Math.Sin(phase);
+                double engineering = raw * 1.05 + 0.2;
+
+                row.Value = raw;
+                row.Engineering = engineering;
+                if (raw > row.Max)
+                {
+                    row.Max = raw;
+                }
+                if (raw < row.Min)
+                {
+                    row.Min = raw;
+                }
+                row.Average = (row.Average * row.Count + raw) / (row.Count + 1);
+                row.Count++;
+                row.Alert = engineering > 160;
+                row.Updated = DateTime.Now;
+
+                // 报警参与排序，始终同步全表；其余采样值仅更新可见区。
+                updates.Add(new CellUpdate(i, liveColumns[6], row.Alert));
+
+                if (visible != null && !visible.Contains(i))
+                {
+                    continue;
+                }
+
+                updates.Add(new CellUpdate(i, liveColumns[0], row.Value));
+                updates.Add(new CellUpdate(i, liveColumns[1], row.Engineering));
+                updates.Add(new CellUpdate(i, liveColumns[2], row.Max));
+                updates.Add(new CellUpdate(i, liveColumns[3], row.Min));
+                updates.Add(new CellUpdate(i, liveColumns[4], row.Average));
+                updates.Add(new CellUpdate(i, liveColumns[5], row.Count));
+                updates.Add(new CellUpdate(i, liveColumns[7], row.Updated));
+            }
+            return updates;
+        }
+
         public static DemoRow Create(int id)
         {
             double raw = 100 + (id % 20) * 10;

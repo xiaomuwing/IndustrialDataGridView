@@ -31,7 +31,7 @@ namespace UniversalUtilities
 
         /// <summary>
         /// 单元格显示格式（例如 <c>F2</c>、<c>N3</c>、<c>yyyy-MM-dd HH:mm:ss</c>）。
-        /// 为 <see langword="null"/> 或空时不做格式化；布尔列忽略该字段。
+        /// 为 <see langword="null"/> 或空时不做格式化；布尔列忽略该字段，字符串不应用数值/日期格式。
         /// </summary>
         public string format;
 
@@ -49,7 +49,7 @@ namespace UniversalUtilities
 
         /// <summary>
         /// 初始是否可见。<see langword="null"/> 或 <see langword="true"/> 表示可见，
-        /// <see langword="false"/> 表示隐藏；控件最左侧 <c>LockedColumnCount</c> 列始终可见。
+        /// <see langword="false"/> 表示隐藏；第一列及 <c>LockedColumnCount</c> 范围内的列始终可见。
         /// </summary>
         public bool? visible;
 

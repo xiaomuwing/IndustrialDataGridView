@@ -138,26 +138,26 @@ namespace UniversalUtilities.Tests
         {
             TestHelpers.RunSta(() =>
             {
-                Assert.ThrowsException<ArgumentNullException>(() => new TestGrid(null));
+                Assert.ThrowsExactly<ArgumentNullException>(() => new TestGrid(null));
 
                 var tooMany = new List<ColumnStruct>();
                 for (int i = 0; i < 257; i++)
                 {
                     tooMany.Add(new ColumnStruct { columnName = "C" + i, columnType = typeof(double) });
                 }
-                Assert.ThrowsException<ArgumentException>(() => new TestGrid(tooMany));
+                Assert.ThrowsExactly<ArgumentException>(() => new TestGrid(tooMany));
 
-                Assert.ThrowsException<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
+                Assert.ThrowsExactly<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
                 {
                     new ColumnStruct { columnName = "A", columnType = typeof(int?) }
                 }));
 
-                Assert.ThrowsException<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
+                Assert.ThrowsExactly<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
                 {
                     new ColumnStruct { columnName = "A", columnType = null }
                 }));
 
-                Assert.ThrowsException<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
+                Assert.ThrowsExactly<ArgumentException>(() => new TestGrid(new List<ColumnStruct>
                 {
                     new ColumnStruct { columnName = "A", columnType = typeof(string) },
                     new ColumnStruct { columnName = "a", columnType = typeof(string) }
@@ -380,16 +380,16 @@ namespace UniversalUtilities.Tests
                 {
                     grid.ShowRows(Rows(1000));
                     Assert.AreEqual(1000, grid.Table.Rows.Count);
-                    Assert.ThrowsException<ArgumentException>(() => grid.ShowRows(Rows(1001)));
-                    Assert.ThrowsException<InvalidOperationException>(() => grid.AppendRow(new Row()));
+                    Assert.ThrowsExactly<ArgumentException>(() => grid.ShowRows(Rows(1001)));
+                    Assert.ThrowsExactly<InvalidOperationException>(() => grid.AppendRow(new Row()));
                     Assert.AreEqual(1000, grid.Table.Rows.Count, "超限失败不应改动现有数据");
                 }
 
                 using (var bad = new BadGrid(Columns()))
                 {
-                    Assert.ThrowsException<InvalidOperationException>(() => bad.ShowRows(Rows(2)));
+                    Assert.ThrowsExactly<InvalidOperationException>(() => bad.ShowRows(Rows(2)));
                     Assert.AreEqual(0, bad.Table.Rows.Count, "映射失败不应留下半套数据");
-                    Assert.ThrowsException<InvalidOperationException>(() => bad.AppendRow(new Row()));
+                    Assert.ThrowsExactly<InvalidOperationException>(() => bad.AppendRow(new Row()));
                 }
             });
         }
@@ -508,7 +508,7 @@ namespace UniversalUtilities.Tests
                     Assert.IsTrue(grid.Columns[0].Visible, "直接隐藏锁定列也应被恢复");
                     Assert.IsTrue(grid.Columns[0].Frozen);
 
-                    Assert.ThrowsException<InvalidOperationException>(
+                    Assert.ThrowsExactly<InvalidOperationException>(
                         () => grid.Columns[2].DisplayIndex = 0,
                         "冻结列本身就会阻止未冻结列移到其前面");
                     CollectionAssert.AreEqual(new[] { "Name", "Value", "Alarm" }, DisplayOrder(grid));
@@ -902,8 +902,8 @@ namespace UniversalUtilities.Tests
                     Assert.IsTrue(grid.IsHandleCreated);
                     Assert.IsTrue(grid.Visible);
 
-                    Assert.ThrowsException<InvalidOperationException>(() => grid.ShowRows(Rows(2)));
-                    Assert.ThrowsException<InvalidOperationException>(() => grid.ClearRows());
+                    Assert.ThrowsExactly<InvalidOperationException>(() => grid.ShowRows(Rows(2)));
+                    Assert.ThrowsExactly<InvalidOperationException>(() => grid.ClearRows());
 
                     form.Hide();
                     Application.DoEvents();

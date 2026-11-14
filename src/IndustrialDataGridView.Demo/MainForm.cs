@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -10,7 +11,7 @@ namespace IndustrialDataGridView.Demo
 {
     /// <summary>
     /// .NET Framework 4.8 独立演示：
-    /// 500 行初始化，10Hz 只刷可见行，支持运行时增删、选中列表、列拖拽换序、前两列锁定和部分列排序。
+    /// 500 行初始化，4Hz 更新可见行与全表报警，支持运行时增删、选中列表、列拖拽换序、前两列锁定和部分列排序。
     /// </summary>
     internal sealed class MainForm : Form
     {
@@ -23,6 +24,7 @@ namespace IndustrialDataGridView.Demo
         private Button addButton;
         private Button deleteButton;
         private CheckBox visibleOnlyCheck;
+        private readonly ContextMenuStrip columnMenu = new ContextMenuStrip();
         private ToolStripStatusLabel rowsLabel;
         private ToolStripStatusLabel visibleLabel;
         private ToolStripStatusLabel selectedLabel;
@@ -35,8 +37,12 @@ namespace IndustrialDataGridView.Demo
         private long cycles;
         private double lastApplyMs;
         private bool running = true;
+        private bool applyingUpdates;
 
-        public MainForm()
+        public MainForm() : this(null) { }
+
+        // 指定路径时只访问该布局，测试或嵌入式演示不读取用户布局与程序目录旧布局。
+        internal MainForm(string layoutFile)
         {
             Text = "IndustrialDataGridView<DemoRow> — .NET Framework 4.8 Demo";
             ClientSize = new Size(1280, 760);
@@ -49,12 +55,17 @@ namespace IndustrialDataGridView.Demo
             {
                 Dock = DockStyle.Fill
             };
-            grid.LayoutFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DemoGrid.layout.json");
+            string userLayout = layoutFile ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "IndustrialDataGridView.Demo", "DemoGrid.layout.json");
+            string oldLayout = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DemoGrid.layout.json");
+            grid.LayoutFile = layoutFile == null && !File.Exists(userLayout) && !File.Exists(userLayout + ".bak") && File.Exists(oldLayout)
+                ? oldLayout : userLayout;
             grid.LockedColumnCount = 2;
             grid.AlarmColumnKey = "Alert";
             grid.AlarmRowBackColor = Color.Red;
             grid.AlarmRowForeColor = Color.White;
             grid.LoadLayout();
+            grid.LayoutFile = userLayout;
 
             liveColumns = new[]
             {
@@ -72,6 +83,7 @@ namespace IndustrialDataGridView.Demo
             nextId = 501;
             grid.ShowRows(rows);
             BuildUi();
+            columnMenu.Opening += delegate { RefreshColumnMenu(); };
 
             grid.Scroll += delegate
             {
@@ -92,7 +104,7 @@ namespace IndustrialDataGridView.Demo
                 UpdateStatus();
             };
 
-            timer = new Timer { Interval = 1000 };
+            timer = new Timer { Interval = 250 };
             timer.Tick += OnTick;
             Shown += delegate
             {
@@ -104,7 +116,9 @@ namespace IndustrialDataGridView.Demo
             FormClosing += delegate
             {
                 timer.Stop();
-                grid.SaveLayout();
+                if (!grid.SaveLayout())
+                    MessageBox.Show(this, "布局未能保存：" + grid.LastLayoutError, "布局保存失败",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
             };
         }
 
@@ -114,7 +128,7 @@ namespace IndustrialDataGridView.Demo
             var toolPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 52,
+                Height = 70,
                 BackColor = Color.FromArgb(42, 42, 45),
                 Padding = new Padding(8, 6, 8, 6)
             };
@@ -122,6 +136,7 @@ namespace IndustrialDataGridView.Demo
             {
                 Dock = DockStyle.Fill,
                 WrapContents = false,
+                AutoScroll = true,
                 FlowDirection = FlowDirection.LeftToRight,
                 BackColor = Color.Transparent
             };
@@ -152,7 +167,15 @@ namespace IndustrialDataGridView.Demo
                 DemoRow row = DemoRows.Create(nextId++);
                 grid.AppendRow(row);
                 rows.Add(row);
-                grid.FirstDisplayedScrollingRowIndex = grid.Rows.Count - 1;
+                foreach (DataGridViewRow displayed in grid.Rows)
+                {
+                    var view = displayed.DataBoundItem as DataRowView;
+                    if (view != null && (int)view["Id"] == row.Id)
+                    {
+                        grid.FirstDisplayedScrollingRowIndex = displayed.Index;
+                        break;
+                    }
+                }
                 UpdateVisibleDataRows();
                 RefreshVisibleRows();
                 UpdateStatus();
@@ -189,11 +212,11 @@ namespace IndustrialDataGridView.Demo
             });
             flow.Controls.Add(deleteButton);
 
-            flow.Controls.Add(MakeButton("保存布局", 84, delegate
+            flow.Controls.Add(MakeButton("保存布局", 90, delegate
             {
                 SetMessage(grid.SaveLayout() ? "布局已保存" : "布局保存失败: " + (grid.LastLayoutError ?? "未设置文件"));
             }));
-            flow.Controls.Add(MakeButton("加载布局", 84, delegate
+            flow.Controls.Add(MakeButton("加载布局", 90, delegate
             {
                 bool ok = grid.LoadLayout();
                 UpdateVisibleDataRows();
@@ -201,7 +224,10 @@ namespace IndustrialDataGridView.Demo
                 UpdateStatus();
                 SetMessage(ok ? "布局已加载" : "布局加载失败: " + (grid.LastLayoutError ?? "无文件"));
             }));
-            flow.Controls.Add(MakeButton("全部显示", 84, delegate
+            var columnsButton = MakeButton("列显隐", 80, delegate { });
+            columnsButton.Click += delegate { columnMenu.Show(columnsButton, new Point(0, columnsButton.Height)); };
+            flow.Controls.Add(columnsButton);
+            flow.Controls.Add(MakeButton("全部显示", 90, delegate
             {
                 grid.ShowAllColumns();
                 UpdateStatus();
@@ -257,7 +283,28 @@ namespace IndustrialDataGridView.Demo
             ResumeLayout(true);
 
             UpdateStatus();
-            SetMessage("拖动列头换序；点击 Id/Name/Status/Group 列头排序；前两列锁定");
+            SetMessage("列显隐：勾选显示、取消隐藏；拖动列头换序；前两列固定");
+        }
+
+        private void RefreshColumnMenu()
+        {
+            while (columnMenu.Items.Count > 0) columnMenu.Items[0].Dispose();
+            var columns = new List<DataGridViewColumn>();
+            foreach (DataGridViewColumn column in grid.Columns) columns.Add(column);
+            columns.Sort((a, b) => a.DisplayIndex.CompareTo(b.DisplayIndex));
+            foreach (DataGridViewColumn column in columns)
+            {
+                bool locked = column.Index == 0 || grid.IsColumnLocked(column.Name);
+                var item = new ToolStripMenuItem(column.HeaderText + (locked ? "（固定）" : ""))
+                { Tag = column.Name, Checked = column.Visible, CheckOnClick = true, Enabled = !locked };
+                item.Click += delegate {
+                    if (item.Checked) grid.ShowColumn(column.Name); else grid.HideColumn(column.Name);
+                    item.Checked = column.Visible;
+                    UpdateVisibleDataRows(); RefreshVisibleRows(); UpdateStatus();
+                    SetMessage((column.Visible ? "已显示 " : "已隐藏 ") + column.HeaderText);
+                };
+                columnMenu.Items.Add(item);
+            }
         }
 
         private static Button MakeButton(string text, int width, EventHandler handler)
@@ -287,9 +334,22 @@ namespace IndustrialDataGridView.Demo
             UpdateVisibleDataRows();
             var watch = Stopwatch.StartNew();
             List<CellUpdate> updates = Simulate();
+            int[] refreshedRows = visibleDataRows;
             if (updates.Count > 0)
             {
-                int applied = grid.ApplyUpdates(updates);
+                int applied;
+                applyingUpdates = true;
+                try
+                {
+                    applied = grid.ApplyUpdates(updates);
+                }
+                finally
+                {
+                    applyingUpdates = false;
+                }
+                // 报警排序可能让新的行进入可见区，整批完成后补刷这些行。
+                UpdateVisibleDataRows();
+                if (refreshedRows != null) RefreshVisibleRows(new HashSet<int>(refreshedRows));
                 watch.Stop();
                 lastApplyMs = watch.Elapsed.TotalMilliseconds;
                 if (applied != updates.Count)
@@ -307,47 +367,7 @@ namespace IndustrialDataGridView.Demo
 
         private List<CellUpdate> Simulate()
         {
-            long cycle = ++cycles;
-            HashSet<int> visible = visibleDataRows == null ? null : new HashSet<int>(visibleDataRows);
-            var updates = new List<CellUpdate>(visible == null ? rows.Count * liveColumns.Length : visibleDataRows.Length * liveColumns.Length);
-
-            for (int i = 0; i < rows.Count; i++)
-            {
-                DemoRow row = rows[i];
-                double phase = cycle * 0.08 + i * 0.17;
-                double raw = 100 + (i % 20) * 10 + 15 * Math.Sin(phase);
-                double engineering = raw * 1.05 + 0.2;
-
-                row.Value = raw;
-                row.Engineering = engineering;
-                if (raw > row.Max)
-                {
-                    row.Max = raw;
-                }
-                if (raw < row.Min)
-                {
-                    row.Min = raw;
-                }
-                row.Average = (row.Average * row.Count + raw) / (row.Count + 1);
-                row.Count++;
-                row.Alert = engineering > 160;
-                row.Updated = DateTime.Now;
-
-                if (visible != null && !visible.Contains(i))
-                {
-                    continue;
-                }
-
-                Add(updates, i, liveColumns[0], row.Value);
-                Add(updates, i, liveColumns[1], row.Engineering);
-                Add(updates, i, liveColumns[2], row.Max);
-                Add(updates, i, liveColumns[3], row.Min);
-                Add(updates, i, liveColumns[4], row.Average);
-                Add(updates, i, liveColumns[5], row.Count);
-                Add(updates, i, liveColumns[6], row.Alert);
-                Add(updates, i, liveColumns[7], row.Updated);
-            }
-            return updates;
+            return DemoRows.Simulate(rows, visibleDataRows, liveColumns, ++cycles);
         }
 
         private void UpdateVisibleDataRows()
@@ -367,9 +387,9 @@ namespace IndustrialDataGridView.Demo
             visibleDataRows = snapshot;
         }
 
-        private void RefreshVisibleRows()
+        private void RefreshVisibleRows(HashSet<int> alreadyRefreshed = null)
         {
-            if (!visibleOnlyCheck.Checked || rows.Count == 0)
+            if (applyingUpdates || !visibleOnlyCheck.Checked || rows.Count == 0)
             {
                 return;
             }
@@ -379,6 +399,7 @@ namespace IndustrialDataGridView.Demo
             for (int i = 0; i < dataRows.Count; i++)
             {
                 int rowIndex = dataRows[i];
+                if (alreadyRefreshed != null && alreadyRefreshed.Contains(rowIndex)) continue;
                 if (rowIndex < 0 || rowIndex >= rows.Count)
                 {
                     continue;
@@ -390,12 +411,19 @@ namespace IndustrialDataGridView.Demo
                 Add(updates, rowIndex, liveColumns[3], row.Min);
                 Add(updates, rowIndex, liveColumns[4], row.Average);
                 Add(updates, rowIndex, liveColumns[5], row.Count);
-                Add(updates, rowIndex, liveColumns[6], row.Alert);
                 Add(updates, rowIndex, liveColumns[7], row.Updated);
             }
             if (updates.Count > 0)
             {
-                grid.ApplyUpdates(updates);
+                applyingUpdates = true;
+                try
+                {
+                    grid.ApplyUpdates(updates);
+                }
+                finally
+                {
+                    applyingUpdates = false;
+                }
             }
         }
 
@@ -437,6 +465,12 @@ namespace IndustrialDataGridView.Demo
             {
                 messageLabel.Text = text;
             }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { timer?.Dispose(); columnMenu.Dispose(); }
+            base.Dispose(disposing);
         }
     }
 }
